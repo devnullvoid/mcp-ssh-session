@@ -9,6 +9,8 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 - **Multi-host Support**: Manage connections to multiple hosts simultaneously
 - **Automatic Reconnection**: Dead connections are detected and automatically re-established
 - **Thread-safe**: Safe for concurrent operations
+- **Network Device Support**: Automatic enable mode handling for routers and switches
+- **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 
 ## Installation
 
@@ -68,6 +70,27 @@ Execute a command on an SSH host using a persistent session.
   "command": "ls -la",
   "key_filename": "~/.ssh/id_rsa",
   "port": 22
+}
+```
+
+**Network device with enable mode:**
+```json
+{
+  "host": "router.example.com",
+  "username": "admin",
+  "password": "ssh_password",
+  "enable_password": "enable_password",
+  "command": "show running-config"
+}
+```
+
+**Unix/Linux with sudo:**
+```json
+{
+  "host": "server.example.com",
+  "username": "user",
+  "sudo_password": "user_password",
+  "command": "systemctl restart nginx"
 }
 ```
 

@@ -16,12 +16,23 @@ def execute_command(
     username: Optional[str] = None,
     password: Optional[str] = None,
     key_filename: Optional[str] = None,
-    port: Optional[int] = None
+    port: Optional[int] = None,
+    enable_password: Optional[str] = None,
+    enable_command: str = "enable",
+    sudo_password: Optional[str] = None,
+    timeout: int = 30
 ) -> str:
     """Execute a command on an SSH host using a persistent session.
 
     The host parameter can be either a hostname/IP or an SSH config alias.
     If an SSH config alias is provided, configuration will be read from ~/.ssh/config.
+
+    For network devices (routers, switches), use enable_password to automatically
+    enter privileged/enable mode before executing commands.
+
+    For Unix/Linux hosts requiring sudo, use sudo_password to automatically handle
+    the sudo password prompt. The command will be automatically prefixed with 'sudo'
+    if not already present.
 
     Args:
         host: Hostname, IP address, or SSH config alias (e.g., "myserver")
@@ -30,6 +41,10 @@ def execute_command(
         password: Password (optional)
         key_filename: Path to SSH key file (optional, will use SSH config)
         port: SSH port (optional, will use SSH config or default 22)
+        enable_password: Enable mode password for network devices (optional)
+        enable_command: Command to enter enable mode (default: "enable")
+        sudo_password: Password for sudo commands on Unix/Linux hosts (optional)
+        timeout: Timeout in seconds for command execution (default: 30)
     """
     stdout, stderr, exit_status = session_manager.execute_command(
         host=host,
@@ -38,6 +53,10 @@ def execute_command(
         password=password,
         key_filename=key_filename,
         port=port,
+        enable_password=enable_password,
+        enable_command=enable_command,
+        sudo_password=sudo_password,
+        timeout=timeout,
     )
 
     result = f"Exit Status: {exit_status}\n\n"

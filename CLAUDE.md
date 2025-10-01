@@ -18,6 +18,9 @@ This MCP server provides tools for AI agents to:
 - **Automatic Reconnection**: Dead connections are detected and automatically re-established
 - **Thread-safe**: Safe for concurrent operations
 - **Flexible Authentication**: Supports both password and key-based authentication
+- **Network Device Support**: Automatic enable mode handling for routers and switches (Cisco, Juniper, etc.)
+- **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
+- **Interactive Shell Handling**: Detects and responds to password prompts automatically
 
 ## Installation
 
@@ -51,6 +54,10 @@ The `host` parameter can be either a hostname/IP or an SSH config alias. If an S
 - `password` (str, optional): Password for authentication
 - `key_filename` (str, optional): Path to SSH private key file (will use SSH config if not provided)
 - `port` (int, optional): SSH port (will use SSH config or default 22 if not provided)
+- `enable_password` (str, optional): Password for enable mode on network devices (routers/switches)
+- `enable_command` (str, optional): Command to enter enable mode (default: "enable")
+- `sudo_password` (str, optional): Password for sudo commands on Unix/Linux hosts
+- `timeout` (int, optional): Timeout in seconds for command execution (default: 30)
 
 **Returns:** Command output including exit status, stdout, and stderr
 
@@ -72,6 +79,39 @@ execute_command(
     username="user",
     command="ls -la /var/log",
     key_filename="~/.ssh/id_rsa"
+)
+```
+
+Network device with enable mode (Cisco router/switch):
+```python
+execute_command(
+    host="router.example.com",
+    username="admin",
+    password="ssh_password",
+    enable_password="enable_password",
+    command="show running-config"
+)
+```
+
+Unix/Linux host with sudo:
+```python
+execute_command(
+    host="server.example.com",
+    username="user",
+    sudo_password="user_password",
+    command="systemctl restart nginx"  # Auto-prefixed with 'sudo'
+)
+```
+
+Custom enable command (Juniper):
+```python
+execute_command(
+    host="juniper-switch",
+    username="admin",
+    password="ssh_password",
+    enable_password="root_password",
+    enable_command="su -",
+    command="show configuration"
 )
 ```
 
@@ -115,6 +155,9 @@ The core session management class that:
 - Automatically detects and removes dead connections
 - Reuses existing connections when possible
 - Falls back to sensible defaults when config is not available
+- Handles interactive prompts for enable mode and sudo authentication
+- Tracks enable mode state per session to avoid re-authentication
+- Uses `exec_command()` for standard SSH hosts and `invoke_shell()` for interactive scenarios
 
 ### MCP Server
 Built with FastMCP, exposing SSH functionality as MCP tools that can be called by AI agents.
