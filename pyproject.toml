@@ -1,0 +1,9 @@
+[project]
+name = "mcp-ssh-session"
+version = "0.1.0"
+description = "MCP server for managing persistent SSH sessions"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp",
+    "paramiko>=3.4.0",
+]
