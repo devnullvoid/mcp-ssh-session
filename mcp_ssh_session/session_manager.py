@@ -82,9 +82,23 @@ class SSHSessionManager:
             self._sessions[session_key] = client
             return client
 
-    def close_session(self, host: str, username: str, port: int = 22):
-        """Close a specific session."""
-        session_key = f"{username}@{host}:{port}"
+    def close_session(self, host: str, username: Optional[str] = None, port: Optional[int] = None):
+        """Close a specific session.
+
+        Args:
+            host: Hostname or SSH config alias
+            username: SSH username (optional, will use config if available)
+            port: SSH port (optional, will use config if available)
+        """
+        # Get SSH config for this host
+        host_config = self._ssh_config.lookup(host)
+
+        # Resolve connection parameters with config precedence
+        resolved_host = host_config.get('hostname', host)
+        resolved_username = username or host_config.get('user', os.getenv('USER', 'root'))
+        resolved_port = port or int(host_config.get('port', 22))
+
+        session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
         with self._lock:
             self._close_session(session_key)
 

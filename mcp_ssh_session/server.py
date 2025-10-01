@@ -60,16 +60,25 @@ def list_sessions() -> str:
 
 
 @mcp.tool()
-def close_session(host: str, username: str, port: int = 22) -> str:
+def close_session(host: str, username: Optional[str] = None, port: Optional[int] = None) -> str:
     """Close a specific SSH session.
 
+    The host parameter can be either a hostname/IP or an SSH config alias.
+
     Args:
-        host: Hostname or IP address
-        username: SSH username
-        port: SSH port (default: 22)
+        host: Hostname, IP address, or SSH config alias
+        username: SSH username (optional, will use SSH config or current user)
+        port: SSH port (optional, will use SSH config or default 22)
     """
     session_manager.close_session(host, username, port)
-    return f"Closed session: {username}@{host}:{port}"
+
+    # Get the resolved values for the response message
+    host_config = session_manager._ssh_config.lookup(host)
+    resolved_host = host_config.get('hostname', host)
+    resolved_username = username or host_config.get('user', 'current user')
+    resolved_port = port or int(host_config.get('port', 22))
+
+    return f"Closed session: {resolved_username}@{resolved_host}:{resolved_port}"
 
 
 @mcp.tool()

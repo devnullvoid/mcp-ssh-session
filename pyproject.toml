@@ -7,3 +7,10 @@ dependencies = [
     "fastmcp",
     "paramiko>=3.4.0",
 ]
+
+[project.scripts]
+mcp-ssh-session = "mcp_ssh_session.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
