@@ -1,4 +1,5 @@
 """MCP server for SSH session management."""
+from typing import Optional
 from fastmcp import FastMCP
 from .session_manager import SSHSessionManager
 
@@ -11,21 +12,24 @@ session_manager = SSHSessionManager()
 @mcp.tool()
 def execute_command(
     host: str,
-    username: str,
     command: str,
-    password: str = None,
-    key_filename: str = None,
-    port: int = 22
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    key_filename: Optional[str] = None,
+    port: Optional[int] = None
 ) -> str:
     """Execute a command on an SSH host using a persistent session.
 
+    The host parameter can be either a hostname/IP or an SSH config alias.
+    If an SSH config alias is provided, configuration will be read from ~/.ssh/config.
+
     Args:
-        host: Hostname or IP address
-        username: SSH username
+        host: Hostname, IP address, or SSH config alias (e.g., "myserver")
         command: Command to execute
+        username: SSH username (optional, will use SSH config or current user)
         password: Password (optional)
-        key_filename: Path to SSH key file (optional)
-        port: SSH port (default: 22)
+        key_filename: Path to SSH key file (optional, will use SSH config)
+        port: SSH port (optional, will use SSH config or default 22)
     """
     stdout, stderr, exit_status = session_manager.execute_command(
         host=host,

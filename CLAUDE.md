@@ -13,6 +13,7 @@ This MCP server provides tools for AI agents to:
 ## Features
 
 - **Persistent Sessions**: SSH connections are reused across multiple command executions, reducing connection overhead
+- **SSH Config Support**: Automatically reads and uses settings from `~/.ssh/config`, including aliases, hosts, ports, users, and identity files
 - **Multi-host Support**: Manage connections to multiple hosts simultaneously
 - **Automatic Reconnection**: Dead connections are detected and automatically re-established
 - **Thread-safe**: Safe for concurrent operations
@@ -41,17 +42,30 @@ python -m mcp_ssh_session
 #### `execute_command`
 Execute a command on an SSH host using a persistent session.
 
+The `host` parameter can be either a hostname/IP or an SSH config alias. If an SSH config alias is provided, configuration will be read from `~/.ssh/config`.
+
 **Parameters:**
-- `host` (str): Hostname or IP address
-- `username` (str): SSH username
-- `command` (str): Command to execute
+- `host` (str, required): Hostname, IP address, or SSH config alias (e.g., "myserver")
+- `command` (str, required): Command to execute
+- `username` (str, optional): SSH username (will use SSH config or current user if not provided)
 - `password` (str, optional): Password for authentication
-- `key_filename` (str, optional): Path to SSH private key file
-- `port` (int, default=22): SSH port
+- `key_filename` (str, optional): Path to SSH private key file (will use SSH config if not provided)
+- `port` (int, optional): SSH port (will use SSH config or default 22 if not provided)
 
 **Returns:** Command output including exit status, stdout, and stderr
 
-**Example:**
+**Examples:**
+
+Using SSH config alias:
+```python
+# If ~/.ssh/config has an entry for "myserver"
+execute_command(
+    host="myserver",
+    command="ls -la /var/log"
+)
+```
+
+Using explicit parameters:
 ```python
 execute_command(
     host="example.com",
@@ -94,10 +108,13 @@ mcp-ssh-session/
 
 ### SSHSessionManager
 The core session management class that:
+- Loads and parses `~/.ssh/config` on initialization
+- Resolves SSH config aliases to actual connection parameters
 - Maintains a dictionary of active SSH connections keyed by `username@host:port`
 - Provides thread-safe access to sessions via a threading lock
 - Automatically detects and removes dead connections
 - Reuses existing connections when possible
+- Falls back to sensible defaults when config is not available
 
 ### MCP Server
 Built with FastMCP, exposing SSH functionality as MCP tools that can be called by AI agents.
