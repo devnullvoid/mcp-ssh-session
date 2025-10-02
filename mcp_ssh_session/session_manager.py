@@ -19,22 +19,23 @@ class SSHSessionManager:
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
-        
+
         # Setup logging
         log_dir = Path('/tmp/mcp_ssh_session_logs')
         log_dir.mkdir(exist_ok=True, parents=True)
         log_file = log_dir / 'mcp_ssh_session.log'
-        
-        # Configure root logger
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(str(log_file)),
-                logging.StreamHandler()
-            ]
-        )
+
+        # Configure logger - only log to file, not to stdout (which would send MCP notifications)
         self.logger = logging.getLogger('ssh_session')
+        self.logger.setLevel(logging.INFO)  # Changed to INFO to reduce verbosity
+        self.logger.propagate = False  # Don't propagate to root logger
+
+        # Only add file handler (no StreamHandler to avoid MCP notifications)
+        file_handler = logging.FileHandler(str(log_file))
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        self.logger.addHandler(file_handler)
         self.logger.info("SSHSessionManager initialized")
 
     def _load_ssh_config(self) -> paramiko.SSHConfig:
@@ -123,11 +124,11 @@ class SSHSessionManager:
         logger.info(f"Starting new enable mode session for {session_key}")
         logger.info(f"Enable command: {enable_command}")
         logger.info("=" * 80)
-        
+
         shell = None
         try:
             logger.debug(f"[ENABLE_MODE] Starting enable mode for session: {session_key}")
-            
+
             # Get an interactive shell
             logger.debug("[ENABLE_MODE] Opening shell channel...")
             shell = client.invoke_shell()
@@ -159,14 +160,14 @@ class SSHSessionManager:
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
                     logger.debug(f"[ENABLE_MODE] Received chunk: {chunk!r}")
-                    
+
                     # Check for password prompt or already in enable mode
                     if re.search(r'[Pp]assword:', output) or '#' in output:
                         if '#' in output:
                             logger.debug("[ENABLE_MODE] Already in enable mode")
                             self._enable_mode[session_key] = True
                             return True, "Already in enable mode"
-                        
+
                         logger.debug("[ENABLE_MODE] Password prompt detected, sending password...")
                         shell.send(f"{enable_password}\n")
                         time.sleep(0.5)
@@ -188,7 +189,7 @@ class SSHSessionManager:
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
                     logger.debug(f"[ENABLE_MODE] Received chunk: {chunk!r}")
-                    
+
                     # Check for enable prompt (ends with #)
                     if '#' in output:
                         logger.debug("[ENABLE_MODE] Enable prompt detected")
@@ -392,7 +393,7 @@ class SSHSessionManager:
                 if shell.recv_ready():
                     output = shell.recv(4096).decode('utf-8', errors='ignore')
                     logger.debug(f"[EXEC_CMD] Initial shell output: {output!r}")
-            
+
             try:
                 # If we're in enable mode, we need to be in config terminal
                 if self._enable_mode.get(session_key, False):
@@ -402,7 +403,7 @@ class SSHSessionManager:
                         logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
                         shell.send(f"{command}\n")
                         time.sleep(0.5)
-                        
+
                         # Read output until we get the prompt back
                         output = ""
                         start_time = time.time()
@@ -411,7 +412,7 @@ class SSHSessionManager:
                                 chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                                 output += chunk
                                 logger.debug(f"[EXEC_CMD] Received chunk: {chunk!r}")
-                                
+
                                 # Check for prompt (ends with # or >)
                                 if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
                                     # Wait a bit more to ensure all output is received
@@ -423,7 +424,7 @@ class SSHSessionManager:
                                     break
                             else:
                                 time.sleep(0.1)
-                        
+
                         # Clean up the output - remove command echo and prompt
                         lines = output.split('\n')
                         if len(lines) > 1:
@@ -434,14 +435,14 @@ class SSHSessionManager:
                                 if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
                                     cleaned_lines.append(line)
                             output = '\n'.join(cleaned_lines).strip()
-                        
+
                         return output, "", 0
                     else:
                         # For other commands, use the existing shell
                         logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
                         shell.send(f"{command}\n")
                         time.sleep(0.5)
-                        
+
                         # Read output until we get the prompt back
                         output = ""
                         start_time = time.time()
@@ -450,7 +451,7 @@ class SSHSessionManager:
                                 chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                                 output += chunk
                                 logger.debug(f"[EXEC_CMD] Received chunk: {chunk!r}")
-                                
+
                                 # Check for prompt (ends with # or >)
                                 if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
                                     # Wait a bit more to ensure all output is received
@@ -462,7 +463,7 @@ class SSHSessionManager:
                                     break
                             else:
                                 time.sleep(0.1)
-                        
+
                         # Clean up the output - remove command echo and prompt
                         lines = output.split('\n')
                         if len(lines) > 1:
@@ -473,7 +474,7 @@ class SSHSessionManager:
                                 if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
                                     cleaned_lines.append(line)
                             output = '\n'.join(cleaned_lines).strip()
-                        
+
                         return output, "", 0
                 else:
                     return "", "Not in enable mode", 1
