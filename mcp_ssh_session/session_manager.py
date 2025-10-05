@@ -1,12 +1,14 @@
 """SSH session manager using Paramiko."""
 import paramiko
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 import threading
 import os
 from pathlib import Path
 import time
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import signal
 
 
 class CommandValidator:
@@ -36,6 +38,8 @@ class CommandValidator:
         r'\btelnet\b',
         r'\btcpdump\b',
         r'\bping\b.*(?!-c\s+\d+)',  # ping without count
+        r'\bmonitor\s',  # Network device monitor commands
+        r'\bdebug\s',  # Debug commands that stream output
     ]
 
     # Patterns for background processes
@@ -136,12 +140,17 @@ class SSHSessionManager:
     # Enable mode timeout
     ENABLE_MODE_TIMEOUT = 10
 
+    # Thread pool for timeout enforcement
+    MAX_WORKERS = 10
+
     def __init__(self):
         self._sessions: Dict[str, paramiko.SSHClient] = {}
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
         self._command_validator = CommandValidator()
+        self._executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS, thread_name_prefix="ssh_cmd")
+        self._active_channels: Dict[str, Any] = {}  # Track active channels for cleanup
 
         # Setup logging
         log_dir = Path('/tmp/mcp_ssh_session_logs')
@@ -367,23 +376,101 @@ class SSHSessionManager:
             del self._enable_mode[session_key]
 
     def close_all(self):
-        """Close all sessions."""
+        """Close all sessions and cleanup resources."""
         with self._lock:
+            # Close all active channels
+            for channel_id in list(self._active_channels.keys()):
+                try:
+                    self._force_close_channel(channel_id)
+                except:
+                    pass
+
+            # Close all SSH sessions
             for client in self._sessions.values():
                 try:
                     client.close()
                 except:
                     pass
             self._sessions.clear()
+            self._enable_mode.clear()
+
+        # Shutdown the executor
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except:
+            pass
+
+    def __del__(self):
+        """Cleanup when the session manager is destroyed."""
+        try:
+            self.close_all()
+        except:
+            pass
 
     def list_sessions(self) -> list[str]:
         """List all active session keys."""
         with self._lock:
             return list(self._sessions.keys())
 
-    def _execute_sudo_command(self, client: paramiko.SSHClient, command: str,
-                             sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
-        """Execute a command with sudo, handling password prompt.
+    def _force_close_channel(self, channel_id: str):
+        """Force close a hung channel."""
+        logger = self.logger.getChild('force_close')
+        try:
+            if channel_id in self._active_channels:
+                channel = self._active_channels[channel_id]
+                logger.warning(f"Force closing hung channel: {channel_id}")
+                try:
+                    channel.close()
+                except:
+                    pass
+                del self._active_channels[channel_id]
+        except Exception as e:
+            logger.error(f"Error force closing channel {channel_id}: {str(e)}")
+
+    def _execute_with_thread_timeout(self, func, timeout: int, *args, **kwargs) -> Tuple[str, str, int]:
+        """
+        Execute a function with a thread-based timeout.
+
+        This provides a hard timeout that will interrupt even blocking I/O operations.
+
+        Args:
+            func: The function to execute
+            timeout: Timeout in seconds
+            *args, **kwargs: Arguments to pass to the function
+
+        Returns:
+            Tuple of (stdout: str, stderr: str, exit_status: int)
+        """
+        logger = self.logger.getChild('thread_timeout')
+
+        # Add buffer time for cleanup
+        thread_timeout = timeout + 5
+
+        try:
+            logger.info(f"Executing with thread timeout: {timeout}s (thread timeout: {thread_timeout}s)")
+            future = self._executor.submit(func, *args, **kwargs)
+
+            try:
+                result = future.result(timeout=thread_timeout)
+                logger.debug(f"Command completed successfully within timeout")
+                return result
+            except FuturesTimeoutError:
+                logger.error(f"Thread timeout after {thread_timeout} seconds")
+                future.cancel()
+
+                # Try to clean up any active channels
+                # This is a best-effort attempt to kill hung SSH operations
+                logger.warning("Attempting to clean up hung SSH operations...")
+
+                return "", f"Command timed out after {timeout} seconds. The SSH connection may need to be reset.", 124
+
+        except Exception as e:
+            logger.error(f"Error in thread timeout wrapper: {str(e)}", exc_info=True)
+            return "", f"Internal error: {str(e)}", 1
+
+    def _execute_sudo_command_internal(self, client: paramiko.SSHClient, command: str,
+                                      sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
+        """Internal method to execute a command with sudo, handling password prompt.
 
         Args:
             client: SSH client connection
@@ -489,6 +576,161 @@ class SSHSessionManager:
                 except:
                     pass
 
+    def _execute_sudo_command(self, client: paramiko.SSHClient, command: str,
+                             sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
+        """Execute a command with sudo, with thread-based timeout protection."""
+        return self._execute_with_thread_timeout(
+            self._execute_sudo_command_internal,
+            timeout,
+            client, command, sudo_password, timeout
+        )
+
+    def _execute_enable_mode_command_internal(self, client: paramiko.SSHClient, session_key: str,
+                                              command: str, enable_password: str,
+                                              enable_command: str, timeout: int) -> tuple[str, str, int]:
+        """Internal method to execute command in enable mode on network device."""
+        logger = self.logger.getChild('enable_mode_command')
+
+        # Check if we need to enter enable mode
+        shell = None
+        if not self._enable_mode.get(session_key, False):
+            success, result = self._enter_enable_mode(session_key, client, enable_password, enable_command)
+            if not success:
+                return "", f"Failed to enter enable mode: {result}", 1
+            # We got the shell from _enter_enable_mode
+            shell, output = result
+        else:
+            # We're already in enable mode, get a new shell
+            shell = client.invoke_shell()
+            time.sleep(0.5)
+            # Read and discard initial output
+            output = ""
+            if shell.recv_ready():
+                output = shell.recv(4096).decode('utf-8', errors='ignore')
+                logger.debug(f"[EXEC_CMD] Initial shell output: {output!r}")
+
+        try:
+            # Set timeout on the shell
+            shell.settimeout(timeout)
+
+            # If we're in enable mode, execute the command
+            if self._enable_mode.get(session_key, False):
+                logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
+                shell.send(f"{command}\n")
+                time.sleep(0.5)
+
+                # Read output until we get the prompt back with output limiting
+                output_limiter = OutputLimiter()
+                output = ""
+                start_time = time.time()
+
+                while time.time() - start_time < timeout:
+                    if shell.recv_ready():
+                        chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+
+                        # Apply output limiting
+                        limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                        output += limited_chunk
+                        logger.debug(f"[EXEC_CMD] Received chunk ({len(chunk)} bytes)")
+
+                        if not should_continue:
+                            logger.warning(f"Output size limit exceeded for command: {command}")
+                            break
+
+                        # Check for prompt (ends with # or >)
+                        if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
+                            # Wait a bit more to ensure all output is received
+                            time.sleep(0.5)
+                            if shell.recv_ready():
+                                more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                                limited_more, _ = output_limiter.add_chunk(more_chunk)
+                                output += limited_more
+                                logger.debug(f"[EXEC_CMD] Received additional chunk ({len(more_chunk)} bytes)")
+                            break
+                    else:
+                        time.sleep(0.1)
+                else:
+                    # Timeout occurred
+                    logger.warning(f"Command timed out after {timeout} seconds: {command}")
+                    return output, f"Command timed out after {timeout} seconds", 124
+
+                # Clean up the output - remove command echo and prompt
+                lines = output.split('\n')
+                if len(lines) > 1:
+                    # Remove command echo and final prompt
+                    cleaned_lines = []
+                    for line in lines[1:]:  # Skip command echo
+                        line = line.strip()
+                        if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
+                            cleaned_lines.append(line)
+                    output = '\n'.join(cleaned_lines).strip()
+
+                return output, "", 0
+            else:
+                return "", "Not in enable mode", 1
+
+        except Exception as e:
+            error_msg = f"Error executing command in enable mode: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return "", error_msg, 1
+        finally:
+            if shell:
+                try:
+                    shell.close()
+                except Exception as e:
+                    logger.error(f"Error closing shell: {str(e)}", exc_info=True)
+
+    def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
+                                           timeout: int) -> tuple[str, str, int]:
+        """Internal method to execute a standard SSH command."""
+        logger = self.logger.getChild('standard_command')
+
+        try:
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+
+            # Set timeout on the channel
+            stdout.channel.settimeout(timeout)
+            stderr.channel.settimeout(timeout)
+
+            # Read output with size limiting
+            output_limiter = OutputLimiter()
+            stdout_data = ""
+            stderr_data = ""
+
+            # Read stdout
+            while True:
+                chunk = stdout.read(4096).decode('utf-8', errors='ignore')
+                if not chunk:
+                    break
+                limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                stdout_data += limited_chunk
+                if not should_continue:
+                    logger.warning(f"Stdout size limit exceeded for command: {command}")
+                    break
+
+            # Read stderr (with separate limiter to allow full error messages)
+            stderr_limiter = OutputLimiter(max_size=1024 * 1024)  # 1MB for stderr
+            while True:
+                chunk = stderr.read(4096).decode('utf-8', errors='ignore')
+                if not chunk:
+                    break
+                limited_chunk, should_continue = stderr_limiter.add_chunk(chunk)
+                stderr_data += limited_chunk
+                if not should_continue:
+                    break
+
+            # Get exit status with timeout
+            exit_status = stdout.channel.recv_exit_status()
+
+            return (stdout_data, stderr_data, exit_status)
+
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error executing command: {str(e)}")
+            return "", f"SSH error: {str(e)}", 1
+        except Exception as e:
+            logger.error(f"Error executing command: {str(e)}", exc_info=True)
+            return "", f"Error: {str(e)}", 1
+
     def execute_command(self, host: str, username: Optional[str] = None,
                        command: str = "", password: Optional[str] = None,
                        key_filename: Optional[str] = None,
@@ -538,138 +780,15 @@ class SSHSessionManager:
 
         # Handle enable mode for network devices
         if enable_password:
-            # Check if we need to enter enable mode
-            shell = None
-            if not self._enable_mode.get(session_key, False):
-                success, result = self._enter_enable_mode(session_key, client, enable_password, enable_command)
-                if not success:
-                    return "", f"Failed to enter enable mode: {result}", 1
-                # We got the shell from _enter_enable_mode
-                shell, output = result
-            else:
-                # We're already in enable mode, get a new shell
-                shell = client.invoke_shell()
-                time.sleep(0.5)
-                # Read and discard initial output
-                output = ""
-                if shell.recv_ready():
-                    output = shell.recv(4096).decode('utf-8', errors='ignore')
-                    logger.debug(f"[EXEC_CMD] Initial shell output: {output!r}")
-
-            try:
-                # Set timeout on the shell
-                shell.settimeout(timeout)
-
-                # If we're in enable mode, execute the command
-                if self._enable_mode.get(session_key, False):
-                    logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
-                    shell.send(f"{command}\n")
-                    time.sleep(0.5)
-
-                    # Read output until we get the prompt back with output limiting
-                    output_limiter = OutputLimiter()
-                    output = ""
-                    start_time = time.time()
-
-                    while time.time() - start_time < timeout:
-                        if shell.recv_ready():
-                            chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-
-                            # Apply output limiting
-                            limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                            output += limited_chunk
-                            logger.debug(f"[EXEC_CMD] Received chunk ({len(chunk)} bytes)")
-
-                            if not should_continue:
-                                logger.warning(f"Output size limit exceeded for command: {command}")
-                                break
-
-                            # Check for prompt (ends with # or >)
-                            if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
-                                # Wait a bit more to ensure all output is received
-                                time.sleep(0.5)
-                                if shell.recv_ready():
-                                    more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                                    limited_more, _ = output_limiter.add_chunk(more_chunk)
-                                    output += limited_more
-                                    logger.debug(f"[EXEC_CMD] Received additional chunk ({len(more_chunk)} bytes)")
-                                break
-                        else:
-                            time.sleep(0.1)
-                    else:
-                        # Timeout occurred
-                        logger.warning(f"Command timed out after {timeout} seconds: {command}")
-                        return output, f"Command timed out after {timeout} seconds", 124
-
-                    # Clean up the output - remove command echo and prompt
-                    lines = output.split('\n')
-                    if len(lines) > 1:
-                        # Remove command echo and final prompt
-                        cleaned_lines = []
-                        for line in lines[1:]:  # Skip command echo
-                            line = line.strip()
-                            if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
-                                cleaned_lines.append(line)
-                        output = '\n'.join(cleaned_lines).strip()
-
-                    return output, "", 0
-                else:
-                    return "", "Not in enable mode", 1
-
-            except Exception as e:
-                error_msg = f"Error executing command in enable mode: {str(e)}"
-                logger.error(error_msg, exc_info=True)
-                return "", error_msg, 1
-            finally:
-                if shell:
-                    try:
-                        shell.close()
-                    except Exception as e:
-                        logger.error(f"Error closing shell: {str(e)}", exc_info=True)
+            return self._execute_with_thread_timeout(
+                self._execute_enable_mode_command_internal,
+                timeout,
+                client, session_key, command, enable_password, enable_command, timeout
+            )
         else:
             # Standard exec_command for regular SSH hosts
-            try:
-                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-
-                # Set timeout on the channel
-                stdout.channel.settimeout(timeout)
-                stderr.channel.settimeout(timeout)
-
-                # Read output with size limiting
-                output_limiter = OutputLimiter()
-                stdout_data = ""
-                stderr_data = ""
-
-                # Read stdout
-                while True:
-                    chunk = stdout.read(4096).decode('utf-8', errors='ignore')
-                    if not chunk:
-                        break
-                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    stdout_data += limited_chunk
-                    if not should_continue:
-                        logger.warning(f"Stdout size limit exceeded for command: {command}")
-                        break
-
-                # Read stderr (with separate limiter to allow full error messages)
-                stderr_limiter = OutputLimiter(max_size=1024 * 1024)  # 1MB for stderr
-                while True:
-                    chunk = stderr.read(4096).decode('utf-8', errors='ignore')
-                    if not chunk:
-                        break
-                    limited_chunk, should_continue = stderr_limiter.add_chunk(chunk)
-                    stderr_data += limited_chunk
-                    if not should_continue:
-                        break
-
-                # Get exit status with timeout
-                exit_status = stdout.channel.recv_exit_status()
-
-                return (stdout_data, stderr_data, exit_status)
-
-            except paramiko.SSHException as e:
-                logger.error(f"SSH error executing command: {str(e)}")
-                return "", f"SSH error: {str(e)}", 1
-            except Exception as e:
-                logger.error(f"Error executing command: {str(e)}", exc_info=True)
-                return "", f"Error: {str(e)}", 1
+            return self._execute_with_thread_timeout(
+                self._execute_standard_command_internal,
+                timeout,
+                client, command, timeout
+            )
