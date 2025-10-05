@@ -1,24 +1,147 @@
 """SSH session manager using Paramiko."""
 import paramiko
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import threading
 import os
 from pathlib import Path
 import time
 import re
-
-
 import logging
-from pathlib import Path
+
+
+class CommandValidator:
+    """Validates commands for safety before execution."""
+
+    # Maximum output size in bytes (10MB)
+    MAX_OUTPUT_SIZE = 10 * 1024 * 1024
+
+    # Patterns that indicate streaming/indefinite commands
+    STREAMING_PATTERNS = [
+        r'\btail\s+.*-f\b',
+        r'\btail\s+.*--follow\b',
+        r'\bwatch\b',
+        r'\btop\b',
+        r'\bhtop\b',
+        r'\bless\b',
+        r'\bmore\b',
+        r'\bvi\b',
+        r'\bvim\b',
+        r'\bnano\b',
+        r'\bemacs\b',
+        r'\b--follow\b',
+        r'\b-f\b.*\btail\b',
+        r'\bnc\s+.*-l\b',  # netcat listen mode
+        r'\bnetcat\s+.*-l\b',
+        r'\bssh\b',  # nested SSH
+        r'\btelnet\b',
+        r'\btcpdump\b',
+        r'\bping\b.*(?!-c\s+\d+)',  # ping without count
+    ]
+
+    # Patterns for background processes
+    BACKGROUND_PATTERNS = [
+        r'&\s*$',  # Command ending with &
+        r'\bnohup\b',
+        r'\bdisown\b',
+        r'\bscreen\b',
+        r'\btmux\b',
+    ]
+
+    # Potentially dangerous commands (optional - can be enabled/disabled)
+    DANGEROUS_PATTERNS = [
+        r'\brm\s+.*-rf\s+/(?!home|tmp)',  # rm -rf on root paths
+        r'\bdd\s+.*of=/dev/',  # dd to device files
+        r'\b:\(\)\{.*:\|:.*\};:',  # fork bomb
+        r'\bmkfs\b',
+        r'\bformat\b',
+    ]
+
+    @classmethod
+    def validate_command(cls, command: str, check_dangerous: bool = False) -> Tuple[bool, Optional[str]]:
+        """
+        Validate a command for safety.
+
+        Args:
+            command: The command to validate
+            check_dangerous: Whether to check for dangerous patterns
+
+        Returns:
+            Tuple of (is_valid: bool, error_message: Optional[str])
+        """
+        command_lower = command.lower().strip()
+
+        # Check for streaming patterns
+        for pattern in cls.STREAMING_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                return False, f"Streaming/interactive command blocked: Matches pattern '{pattern}'. Use finite operations (e.g., 'tail -n 100' instead of 'tail -f')."
+
+        # Check for background processes
+        for pattern in cls.BACKGROUND_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                return False, f"Background process blocked: Matches pattern '{pattern}'. Background processes are not allowed."
+
+        # Check for dangerous commands (optional)
+        if check_dangerous:
+            for pattern in cls.DANGEROUS_PATTERNS:
+                if re.search(pattern, command, re.IGNORECASE):
+                    return False, f"Dangerous command blocked: Matches pattern '{pattern}'. This operation is not allowed for safety."
+
+        return True, None
+
+
+class OutputLimiter:
+    """Limits output size to prevent memory issues."""
+
+    def __init__(self, max_size: int = CommandValidator.MAX_OUTPUT_SIZE):
+        self.max_size = max_size
+        self.current_size = 0
+        self.truncated = False
+
+    def add_chunk(self, chunk: str) -> Tuple[str, bool]:
+        """
+        Add a chunk of output, enforcing size limits.
+
+        Args:
+            chunk: The chunk of output to add
+
+        Returns:
+            Tuple of (chunk_to_add: str, should_continue: bool)
+        """
+        chunk_size = len(chunk.encode('utf-8'))
+
+        if self.current_size + chunk_size > self.max_size:
+            # Calculate how much we can still add
+            remaining = self.max_size - self.current_size
+            if remaining > 0:
+                # Truncate the chunk
+                truncated_chunk = chunk.encode('utf-8')[:remaining].decode('utf-8', errors='ignore')
+                self.current_size = self.max_size
+                self.truncated = True
+                truncation_msg = f"\n\n[OUTPUT TRUNCATED: Maximum output size of {self.max_size} bytes exceeded]"
+                return truncated_chunk + truncation_msg, False
+            else:
+                return "", False
+
+        self.current_size += chunk_size
+        return chunk, True
+
 
 class SSHSessionManager:
-    """Manages persistent SSH sessions."""
+    """Manages persistent SSH sessions with safety protections."""
+
+    # Default timeouts
+    DEFAULT_COMMAND_TIMEOUT = 30
+    MAX_COMMAND_TIMEOUT = 300  # 5 minutes maximum
+
+    # Enable mode timeout
+    ENABLE_MODE_TIMEOUT = 10
 
     def __init__(self):
         self._sessions: Dict[str, paramiko.SSHClient] = {}
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
+        self._command_validator = CommandValidator()
 
         # Setup logging
         log_dir = Path('/tmp/mcp_ssh_session_logs')
@@ -271,12 +394,19 @@ class SSHSessionManager:
         Returns:
             Tuple of (stdout: str, stderr: str, exit_status: int)
         """
+        logger = self.logger.getChild('sudo_command')
+        shell = None
+
         try:
+            # Enforce timeout limits
+            timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
+
             # Ensure command starts with sudo
             if not command.strip().startswith('sudo'):
                 command = f"sudo {command}"
 
             shell = client.invoke_shell()
+            shell.settimeout(timeout)
             time.sleep(0.5)
 
             # Clear any initial output
@@ -287,7 +417,8 @@ class SSHSessionManager:
             shell.send(command + '\n')
             time.sleep(0.5)
 
-            # Wait for password prompt or command output
+            # Wait for password prompt or command output with output limiting
+            output_limiter = OutputLimiter()
             output = ""
             password_sent = False
             start_time = time.time()
@@ -295,7 +426,14 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                    output += chunk
+
+                    # Apply output limiting
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    output += limited_chunk
+
+                    if not should_continue:
+                        logger.warning(f"Output size limit exceeded for sudo command")
+                        break
 
                     # Look for sudo password prompt
                     if not password_sent and re.search(r'\[sudo\].*password|password.*:', output, re.IGNORECASE):
@@ -310,12 +448,16 @@ class SSHSessionManager:
                         # Wait a bit more to ensure all output is received
                         time.sleep(0.3)
                         if shell.recv_ready():
-                            output += shell.recv(4096).decode('utf-8', errors='ignore')
+                            more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                            limited_more, _ = output_limiter.add_chunk(more_chunk)
+                            output += limited_more
                         break
                 else:
                     time.sleep(0.1)
-
-            shell.close()
+            else:
+                # Timeout occurred
+                logger.warning(f"Sudo command timed out after {timeout} seconds")
+                return "", f"Command timed out after {timeout} seconds", 124
 
             # Clean up the output - remove command echo and prompt
             lines = output.split('\n')
@@ -334,8 +476,18 @@ class SSHSessionManager:
 
             return output, "", 0
 
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error in sudo command: {str(e)}")
+            return "", f"SSH error: {str(e)}", 1
         except Exception as e:
+            logger.error(f"Error executing sudo command: {str(e)}", exc_info=True)
             return "", f"Error executing sudo command: {str(e)}", 1
+        finally:
+            if shell:
+                try:
+                    shell.close()
+                except:
+                    pass
 
     def execute_command(self, host: str, username: Optional[str] = None,
                        command: str = "", password: Optional[str] = None,
@@ -360,7 +512,17 @@ class SSHSessionManager:
             timeout: Timeout in seconds for command execution (default: 30)
         """
         logger = self.logger.getChild('execute_command')
-        logger.debug(f"Executing command on {host}: {command}")
+        logger.info(f"Executing command on {host}: {command}")
+
+        # Validate command for safety
+        is_valid, error_msg = self._command_validator.validate_command(command)
+        if not is_valid:
+            logger.warning(f"Command validation failed: {error_msg}")
+            return "", error_msg, 1
+
+        # Enforce timeout limits
+        timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
+        logger.debug(f"Using timeout: {timeout} seconds")
         # Get SSH config for this host
         host_config = self._ssh_config.lookup(host)
         resolved_host = host_config.get('hostname', host)
@@ -395,87 +557,62 @@ class SSHSessionManager:
                     logger.debug(f"[EXEC_CMD] Initial shell output: {output!r}")
 
             try:
-                # If we're in enable mode, we need to be in config terminal
+                # Set timeout on the shell
+                shell.settimeout(timeout)
+
+                # If we're in enable mode, execute the command
                 if self._enable_mode.get(session_key, False):
-                    # For EdgeSwitch, we need to enter config terminal first for some commands
-                    if any(cmd in command.lower() for cmd in ['show run', 'show config', 'show interface', 'show vlan']):
-                        # Send command with proper newline handling
-                        logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
-                        shell.send(f"{command}\n")
-                        time.sleep(0.5)
+                    logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
+                    shell.send(f"{command}\n")
+                    time.sleep(0.5)
 
-                        # Read output until we get the prompt back
-                        output = ""
-                        start_time = time.time()
-                        while time.time() - start_time < timeout:
-                            if shell.recv_ready():
-                                chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                                output += chunk
-                                logger.debug(f"[EXEC_CMD] Received chunk: {chunk!r}")
+                    # Read output until we get the prompt back with output limiting
+                    output_limiter = OutputLimiter()
+                    output = ""
+                    start_time = time.time()
 
-                                # Check for prompt (ends with # or >)
-                                if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
-                                    # Wait a bit more to ensure all output is received
-                                    time.sleep(0.5)
-                                    if shell.recv_ready():
-                                        more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                                        output += more_chunk
-                                        logger.debug(f"[EXEC_CMD] Received additional chunk: {more_chunk!r}")
-                                    break
-                            else:
-                                time.sleep(0.1)
+                    while time.time() - start_time < timeout:
+                        if shell.recv_ready():
+                            chunk = shell.recv(4096).decode('utf-8', errors='ignore')
 
-                        # Clean up the output - remove command echo and prompt
-                        lines = output.split('\n')
-                        if len(lines) > 1:
-                            # Remove command echo and final prompt
-                            cleaned_lines = []
-                            for line in lines[1:]:  # Skip command echo
-                                line = line.strip()
-                                if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
-                                    cleaned_lines.append(line)
-                            output = '\n'.join(cleaned_lines).strip()
+                            # Apply output limiting
+                            limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                            output += limited_chunk
+                            logger.debug(f"[EXEC_CMD] Received chunk ({len(chunk)} bytes)")
 
-                        return output, "", 0
+                            if not should_continue:
+                                logger.warning(f"Output size limit exceeded for command: {command}")
+                                break
+
+                            # Check for prompt (ends with # or >)
+                            if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
+                                # Wait a bit more to ensure all output is received
+                                time.sleep(0.5)
+                                if shell.recv_ready():
+                                    more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                                    limited_more, _ = output_limiter.add_chunk(more_chunk)
+                                    output += limited_more
+                                    logger.debug(f"[EXEC_CMD] Received additional chunk ({len(more_chunk)} bytes)")
+                                break
+                        else:
+                            time.sleep(0.1)
                     else:
-                        # For other commands, use the existing shell
-                        logger.debug(f"[EXEC_CMD] Sending command in enable mode: {command}")
-                        shell.send(f"{command}\n")
-                        time.sleep(0.5)
+                        # Timeout occurred
+                        logger.warning(f"Command timed out after {timeout} seconds: {command}")
+                        return output, f"Command timed out after {timeout} seconds", 124
 
-                        # Read output until we get the prompt back
-                        output = ""
-                        start_time = time.time()
-                        while time.time() - start_time < timeout:
-                            if shell.recv_ready():
-                                chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                                output += chunk
-                                logger.debug(f"[EXEC_CMD] Received chunk: {chunk!r}")
+                    # Clean up the output - remove command echo and prompt
+                    lines = output.split('\n')
+                    if len(lines) > 1:
+                        # Remove command echo and final prompt
+                        cleaned_lines = []
+                        for line in lines[1:]:  # Skip command echo
+                            line = line.strip()
+                            if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
+                                cleaned_lines.append(line)
+                        output = '\n'.join(cleaned_lines).strip()
 
-                                # Check for prompt (ends with # or >)
-                                if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
-                                    # Wait a bit more to ensure all output is received
-                                    time.sleep(0.5)
-                                    if shell.recv_ready():
-                                        more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                                        output += more_chunk
-                                        logger.debug(f"[EXEC_CMD] Received additional chunk: {more_chunk!r}")
-                                    break
-                            else:
-                                time.sleep(0.1)
-
-                        # Clean up the output - remove command echo and prompt
-                        lines = output.split('\n')
-                        if len(lines) > 1:
-                            # Remove command echo and final prompt
-                            cleaned_lines = []
-                            for line in lines[1:]:  # Skip command echo
-                                line = line.strip()
-                                if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
-                                    cleaned_lines.append(line)
-                            output = '\n'.join(cleaned_lines).strip()
-
-                        return output, "", 0
+                    return output, "", 0
                 else:
                     return "", "Not in enable mode", 1
 
@@ -491,11 +628,48 @@ class SSHSessionManager:
                         logger.error(f"Error closing shell: {str(e)}", exc_info=True)
         else:
             # Standard exec_command for regular SSH hosts
-            stdin, stdout, stderr = client.exec_command(command)
-            exit_status = stdout.channel.recv_exit_status()
+            try:
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
 
-            return (
-                stdout.read().decode('utf-8'),
-                stderr.read().decode('utf-8'),
-                exit_status
-            )
+                # Set timeout on the channel
+                stdout.channel.settimeout(timeout)
+                stderr.channel.settimeout(timeout)
+
+                # Read output with size limiting
+                output_limiter = OutputLimiter()
+                stdout_data = ""
+                stderr_data = ""
+
+                # Read stdout
+                while True:
+                    chunk = stdout.read(4096).decode('utf-8', errors='ignore')
+                    if not chunk:
+                        break
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    stdout_data += limited_chunk
+                    if not should_continue:
+                        logger.warning(f"Stdout size limit exceeded for command: {command}")
+                        break
+
+                # Read stderr (with separate limiter to allow full error messages)
+                stderr_limiter = OutputLimiter(max_size=1024 * 1024)  # 1MB for stderr
+                while True:
+                    chunk = stderr.read(4096).decode('utf-8', errors='ignore')
+                    if not chunk:
+                        break
+                    limited_chunk, should_continue = stderr_limiter.add_chunk(chunk)
+                    stderr_data += limited_chunk
+                    if not should_continue:
+                        break
+
+                # Get exit status with timeout
+                exit_status = stdout.channel.recv_exit_status()
+
+                return (stdout_data, stderr_data, exit_status)
+
+            except paramiko.SSHException as e:
+                logger.error(f"SSH error executing command: {str(e)}")
+                return "", f"SSH error: {str(e)}", 1
+            except Exception as e:
+                logger.error(f"Error executing command: {str(e)}", exc_info=True)
+                return "", f"Error: {str(e)}", 1
