@@ -21,25 +21,33 @@ class CommandValidator:
     STREAMING_PATTERNS = [
         r'\btail\s+.*-f\b',
         r'\btail\s+.*--follow\b',
-        r'\bwatch\b',
-        r'\btop\b',
-        r'\bhtop\b',
-        r'\bless\b',
-        r'\bmore\b',
-        r'\bvi\b',
-        r'\bvim\b',
-        r'\bnano\b',
-        r'\bemacs\b',
+        r'^watch\b',  # watch at start of command
+        r'\|\s*watch\b',  # watch in pipeline
+        r'^top\b',  # top at start of command
+        r'\|\s*top\b',  # top in pipeline
+        r'^htop\b',
+        r'\|\s*htop\b',
+        r'^less\b',  # less at start of command
+        r'\|\s*less\b',  # less in pipeline
+        r'^more\b',  # more at start of command
+        r'\|\s*more\b',  # more in pipeline
+        r'^vi\s',  # vi with arguments
+        r'^vim\s',  # vim with arguments
+        r'^nano\s',  # nano with arguments
+        r'^emacs\s',  # emacs with arguments
         r'\b--follow\b',
         r'\b-f\b.*\btail\b',
         r'\bnc\s+.*-l\b',  # netcat listen mode
         r'\bnetcat\s+.*-l\b',
-        r'\bssh\b',  # nested SSH
-        r'\btelnet\b',
-        r'\btcpdump\b',
-        r'\bping\b.*(?!-c\s+\d+)',  # ping without count
-        r'\bmonitor\s',  # Network device monitor commands
-        r'\bdebug\s',  # Debug commands that stream output
+        r'^ssh\s',  # ssh command at start (nested SSH)
+        r'\|\s*ssh\s',  # ssh in pipeline
+        r'^telnet\s',  # telnet at start
+        r'\|\s*telnet\s',  # telnet in pipeline
+        r'^tcpdump\b',  # tcpdump at start
+        r'\|\s*tcpdump\b',  # tcpdump in pipeline
+        r'\bping\s+(?!.*-c\s+\d+)',  # ping without count flag
+        r'^monitor\s',  # Network device monitor commands at start
+        r'^debug\s',  # Debug commands at start
     ]
 
     # Patterns for background processes

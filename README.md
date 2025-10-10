@@ -21,10 +21,10 @@ Add to your `~/.claude.json`:
 ```json
 {
   "mcpServers": {
-    "mcp-ssh-session": {
+    "ssh-session": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "/path/to/mcp-ssh-session", "mcp-ssh-session"],
+      "args": ["uvx git+https://github.com/devnullvoid/mcp-ssh-session.git"],
       "env": {}
     }
   }

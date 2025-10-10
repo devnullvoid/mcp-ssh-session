@@ -5,7 +5,7 @@ from .session_manager import SSHSessionManager
 
 
 # Initialize the MCP server
-mcp = FastMCP("mcp-ssh-session")
+mcp = FastMCP("ssh-session")
 session_manager = SSHSessionManager()
 
 
