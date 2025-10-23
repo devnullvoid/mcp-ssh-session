@@ -105,3 +105,77 @@ def close_all_sessions() -> str:
     """Close all active SSH sessions."""
     session_manager.close_all()
     return "All SSH sessions closed"
+
+
+@mcp.tool()
+def read_file(
+    host: str,
+    remote_path: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    key_filename: Optional[str] = None,
+    port: Optional[int] = None,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+    max_bytes: Optional[int] = None,
+) -> str:
+    """Read a remote file over SSH."""
+    content, stderr, exit_status = session_manager.read_file(
+        host=host,
+        remote_path=remote_path,
+        username=username,
+        password=password,
+        key_filename=key_filename,
+        port=port,
+        encoding=encoding,
+        errors=errors,
+        max_bytes=max_bytes,
+    )
+
+    result = f"Exit Status: {exit_status}\n\n"
+    if content:
+        result += f"CONTENT:\n{content}\n"
+    if stderr:
+        result += f"STDERR:\n{stderr}\n"
+    return result
+
+
+@mcp.tool()
+def write_file(
+    host: str,
+    remote_path: str,
+    content: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    key_filename: Optional[str] = None,
+    port: Optional[int] = None,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+    append: bool = False,
+    make_dirs: bool = False,
+    permissions: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """Write content to a remote file over SSH."""
+    message, stderr, exit_status = session_manager.write_file(
+        host=host,
+        remote_path=remote_path,
+        content=content,
+        username=username,
+        password=password,
+        key_filename=key_filename,
+        port=port,
+        encoding=encoding,
+        errors=errors,
+        append=append,
+        make_dirs=make_dirs,
+        permissions=permissions,
+        max_bytes=max_bytes,
+    )
+
+    result = f"Exit Status: {exit_status}\n\n"
+    if message:
+        result += f"MESSAGE:\n{message}\n"
+    if stderr:
+        result += f"STDERR:\n{stderr}\n"
+    return result

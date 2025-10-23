@@ -40,14 +40,20 @@ show monitor         # ✅ Allowed (static command)
 - **Graceful truncation**: Adds clear message when limit is exceeded
 - **Memory protection**: Prevents OOM errors from large outputs
 
-### 4. **Timeout Configuration**
+### 4. **Safe File Transfers**
+- **2 MB cap** per read/write operation using SFTP helpers
+- **Directory safeguards**: Optional recursive directory creation with validation
+- **Informative truncation**: Read operations append a notice when output is truncated
+- **Permission-aware**: `PermissionError` and other filesystem issues are surfaced cleanly
+
+### 5. **Timeout Configuration**
 ```python
 DEFAULT_COMMAND_TIMEOUT = 30      # 30 seconds default
 MAX_COMMAND_TIMEOUT = 300         # 5 minutes hard maximum
 ENABLE_MODE_TIMEOUT = 10          # 10 seconds for enable mode
 ```
 
-### 5. **Session Recovery**
+### 6. **Session Recovery**
 - **Active channel tracking**: Monitors all open SSH channels
 - **Force close capability**: Can terminate hung channels
 - **Executor shutdown**: Properly cleans up thread pool on exit

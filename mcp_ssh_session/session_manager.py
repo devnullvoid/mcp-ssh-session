@@ -9,6 +9,8 @@ import re
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import signal
+import posixpath
+import stat
 
 
 class CommandValidator:
@@ -151,6 +153,9 @@ class SSHSessionManager:
     # Thread pool for timeout enforcement
     MAX_WORKERS = 10
 
+    # Maximum bytes allowed for file read/write operations (2MB)
+    MAX_FILE_TRANSFER_SIZE = 2 * 1024 * 1024
+
     def __init__(self):
         self._sessions: Dict[str, paramiko.SSHClient] = {}
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
@@ -178,6 +183,15 @@ class SSHSessionManager:
         self.logger.addHandler(file_handler)
         self.logger.info("SSHSessionManager initialized")
 
+    def _resolve_connection(self, host: str, username: Optional[str], port: Optional[int]) -> tuple[Dict[str, Any], str, str, int, str]:
+        """Resolve SSH connection parameters using config precedence."""
+        host_config = self._ssh_config.lookup(host)
+        resolved_host = host_config.get('hostname', host)
+        resolved_username = username or host_config.get('user', os.getenv('USER', 'root'))
+        resolved_port = port or int(host_config.get('port', 22))
+        session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
+        return host_config, resolved_host, resolved_username, resolved_port, session_key
+
     def _load_ssh_config(self) -> paramiko.SSHConfig:
         """Load SSH config from default locations."""
         ssh_config = paramiko.SSHConfig()
@@ -203,15 +217,10 @@ class SSHSessionManager:
             port: SSH port (optional, will use config if available, default 22)
         """
         # Get SSH config for this host
-        host_config = self._ssh_config.lookup(host)
-
-        # Resolve connection parameters with config precedence
-        resolved_host = host_config.get('hostname', host)
-        resolved_username = username or host_config.get('user', os.getenv('USER', 'root'))
-        resolved_port = port or int(host_config.get('port', 22))
+        host_config, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
+            host, username, port
+        )
         resolved_key = key_filename or host_config.get('identityfile', [None])[0]
-
-        session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
 
         with self._lock:
             if session_key in self._sessions:
@@ -359,15 +368,7 @@ class SSHSessionManager:
             username: SSH username (optional, will use config if available)
             port: SSH port (optional, will use config if available)
         """
-        # Get SSH config for this host
-        host_config = self._ssh_config.lookup(host)
-
-        # Resolve connection parameters with config precedence
-        resolved_host = host_config.get('hostname', host)
-        resolved_username = username or host_config.get('user', os.getenv('USER', 'root'))
-        resolved_port = port or int(host_config.get('port', 22))
-
-        session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
+        _, _, _, _, session_key = self._resolve_connection(host, username, port)
         with self._lock:
             self._close_session(session_key)
 
@@ -434,6 +435,29 @@ class SSHSessionManager:
                 del self._active_channels[channel_id]
         except Exception as e:
             logger.error(f"Error force closing channel {channel_id}: {str(e)}")
+
+    def _ensure_remote_dirs(self, sftp: paramiko.SFTPClient, remote_dir: str):
+        """Ensure remote directory structure exists when writing files."""
+        if not remote_dir or remote_dir in (".", "/"):
+            return
+
+        directories = []
+        current = remote_dir
+
+        while current and current not in (".", "/"):
+            directories.append(current)
+            next_dir = posixpath.dirname(current)
+            if next_dir == current:
+                break
+            current = next_dir
+
+        for directory in reversed(directories):
+            try:
+                attrs = sftp.stat(directory)
+                if not stat.S_ISDIR(attrs.st_mode):
+                    raise IOError(f"Remote path exists and is not a directory: {directory}")
+            except FileNotFoundError:
+                sftp.mkdir(directory)
 
     def _execute_with_thread_timeout(self, func, timeout: int, *args, **kwargs) -> Tuple[str, str, int]:
         """
@@ -739,6 +763,138 @@ class SSHSessionManager:
             logger.error(f"Error executing command: {str(e)}", exc_info=True)
             return "", f"Error: {str(e)}", 1
 
+    def read_file(self, host: str, remote_path: str, username: Optional[str] = None,
+                  password: Optional[str] = None, key_filename: Optional[str] = None,
+                  port: Optional[int] = None, encoding: str = "utf-8",
+                  errors: str = "replace", max_bytes: Optional[int] = None) -> tuple[str, str, int]:
+        """Read a remote file over SSH using SFTP."""
+        logger = self.logger.getChild('read_file')
+        logger.info(f"Reading remote file on {host}: {remote_path}")
+
+        if not remote_path:
+            return "", "Remote path must be provided", 1
+
+        _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        client = self.get_or_create_session(host, username, password, key_filename, port)
+
+        byte_limit = self.MAX_FILE_TRANSFER_SIZE
+        if max_bytes is not None:
+            byte_limit = min(max_bytes, self.MAX_FILE_TRANSFER_SIZE)
+
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+            attrs = sftp.stat(remote_path)
+            if stat.S_ISDIR(attrs.st_mode):
+                return "", f"Remote path is a directory: {remote_path}", 1
+
+            with sftp.file(remote_path, "rb") as remote_file:
+                data = remote_file.read(byte_limit + 1)
+
+            truncated = len(data) > byte_limit
+            if truncated:
+                data = data[:byte_limit]
+
+            used_encoding = encoding or "utf-8"
+            used_errors = errors or "replace"
+
+            try:
+                content = data.decode(used_encoding, used_errors)
+            except UnicodeDecodeError as e:
+                logger.error(f"Decode error reading file {remote_path} on {session_key}: {str(e)}")
+                return "", f"Failed to decode file using encoding '{used_encoding}': {str(e)}", 1
+
+            stderr_msg = ""
+            if truncated:
+                stderr_msg = (
+                    f"Content truncated to {byte_limit} bytes. Increase max_bytes to retrieve full file."
+                )
+                content += f"\n\n[CONTENT TRUNCATED after {byte_limit} bytes]"
+
+            return content, stderr_msg, 0
+        except FileNotFoundError:
+            return "", f"Remote file not found: {remote_path}", 1
+        except PermissionError as e:
+            return "", f"Permission denied reading file: {str(e)}", 1
+        except Exception as e:
+            logger.error(f"Error reading file {remote_path} on {session_key}: {str(e)}", exc_info=True)
+            return "", f"Error reading remote file: {str(e)}", 1
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
+    def write_file(self, host: str, remote_path: str, content: str,
+                   username: Optional[str] = None, password: Optional[str] = None,
+                   key_filename: Optional[str] = None, port: Optional[int] = None,
+                   encoding: str = "utf-8", errors: str = "strict",
+                   append: bool = False, make_dirs: bool = False,
+                   permissions: Optional[int] = None,
+                   max_bytes: Optional[int] = None) -> tuple[str, str, int]:
+        """Write content to a remote file over SSH using SFTP."""
+        logger = self.logger.getChild('write_file')
+        logger.info(f"Writing remote file on {host}: {remote_path} (append={append})")
+
+        if not remote_path:
+            return "", "Remote path must be provided", 1
+
+        used_encoding = encoding or "utf-8"
+        used_errors = errors or "strict"
+
+        try:
+            data = content.encode(used_encoding, used_errors)
+        except Exception as e:
+            return "", f"Failed to encode content using encoding '{used_encoding}': {str(e)}", 1
+
+        byte_limit = self.MAX_FILE_TRANSFER_SIZE
+        if max_bytes is not None:
+            byte_limit = min(max_bytes, self.MAX_FILE_TRANSFER_SIZE)
+
+        if len(data) > byte_limit:
+            return "", (
+                f"Content size {len(data)} bytes exceeds maximum allowed {byte_limit} bytes. "
+                "Split the write into smaller chunks."
+            ), 1
+
+        _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        client = self.get_or_create_session(host, username, password, key_filename, port)
+
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+
+            if make_dirs:
+                directory = posixpath.dirname(remote_path)
+                self._ensure_remote_dirs(sftp, directory)
+
+            mode = "ab" if append else "wb"
+            with sftp.file(remote_path, mode) as remote_file:
+                remote_file.write(data)
+                remote_file.flush()
+
+            if permissions is not None:
+                sftp.chmod(remote_path, permissions)
+
+            message = f"Wrote {len(data)} bytes to {remote_path}"
+            if append:
+                message += " (append)"
+            return message, "", 0
+        except FileNotFoundError:
+            return "", f"Remote path not found: {remote_path}", 1
+        except PermissionError as e:
+            return "", f"Permission denied writing file: {str(e)}", 1
+        except Exception as e:
+            logger.error(f"Error writing file {remote_path} on {session_key}: {str(e)}", exc_info=True)
+            return "", f"Error writing remote file: {str(e)}", 1
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
     def execute_command(self, host: str, username: Optional[str] = None,
                        command: str = "", password: Optional[str] = None,
                        key_filename: Optional[str] = None,
@@ -774,11 +930,9 @@ class SSHSessionManager:
         timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
         logger.debug(f"Using timeout: {timeout} seconds")
         # Get SSH config for this host
-        host_config = self._ssh_config.lookup(host)
-        resolved_host = host_config.get('hostname', host)
-        resolved_username = username or host_config.get('user', os.getenv('USER', 'root'))
-        resolved_port = port or int(host_config.get('port', 22))
-        session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
+        _, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
+            host, username, port
+        )
 
         client = self.get_or_create_session(host, username, password, key_filename, port)
 

@@ -11,6 +11,7 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 - **Thread-safe**: Safe for concurrent operations
 - **Network Device Support**: Automatic enable mode handling for routers and switches
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
+- **File Operations**: Safe helpers to read and write remote files over SFTP
 
 ## Installation
 
@@ -108,6 +109,39 @@ Close a specific SSH session.
 
 #### `close_all_sessions`
 Close all active SSH sessions.
+
+#### `read_file`
+Read the contents of a remote file via SFTP.
+
+```json
+{
+  "host": "myserver",
+  "remote_path": "/etc/nginx/nginx.conf",
+  "max_bytes": 131072
+}
+```
+
+- Uses persistent SSH sessions and opens short-lived SFTP channels
+- Enforces a 2 MB maximum per request (configurable per call up to that limit)
+- Returns truncated notice when the content size exceeds the requested limit
+
+#### `write_file`
+Write text content to a remote file via SFTP.
+
+```json
+{
+  "host": "myserver",
+  "remote_path": "/tmp/app.env",
+  "content": "DEBUG=true\n",
+  "append": true,
+  "make_dirs": true
+}
+```
+
+- Content larger than 2 MB is rejected for safety
+- Optional `append` mode to add to existing files
+- Optional `make_dirs` flag will create missing parent directories
+- Supports `permissions` to set octal file modes after write (e.g., `420` for `0644`)
 
 ## SSH Config Support
 
