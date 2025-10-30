@@ -189,6 +189,14 @@ The project uses Python 3.10+ and is structured as a standard Python package.
 - **[server.py](mcp_ssh_session/server.py)**: MCP tool definitions and request handling
 - **[session_manager.py](mcp_ssh_session/session_manager.py)**: Core SSH session lifecycle management
 
+## Release Process
+
+1. Update the version in `pyproject.toml` and `mcp_ssh_session/__init__.py`, then commit the change.
+2. Build and smoke-test distributions locally with `python -m pip install --upgrade pip build` followed by `python -m build`, then verify `dist/` artifacts if desired.
+3. Tag the release: `git tag -a vX.Y.Z -m "Release X.Y.Z"` and push both the branch and tag (`git push origin main --follow-tags` or `git push origin vX.Y.Z`).
+4. Create the GitHub release (via UI or `gh release create vX.Y.Z --generate-notes -t "vX.Y.Z"`). This triggers the `publish.yaml` workflow, which builds and uploads the package to PyPI using Trusted Publishing.
+5. Monitor the “Publish package to PyPI” workflow in GitHub Actions and confirm the new version appears on https://pypi.org/project/mcp-ssh-session/.
+
 ## License
 
 Distributed under the MIT License. See `LICENSE` for details.
