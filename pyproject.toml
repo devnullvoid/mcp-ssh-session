@@ -3,6 +3,31 @@ name = "mcp-ssh-session"
 version = "0.1.0"
 description = "MCP server for managing persistent SSH sessions"
 requires-python = ">=3.10"
+readme = "README.md"
+authors = [
+    { name = "Jon" },
+]
+license = { file = "LICENSE" }
+keywords = [
+    "mcp",
+    "ssh",
+    "fastmcp",
+    "cli",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "fastmcp",
     "paramiko>=3.4.0",
@@ -10,6 +35,11 @@ dependencies = [
 
 [project.scripts]
 mcp-ssh-session = "mcp_ssh_session.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/devnullvoid/mcp-ssh-session"
+Repository = "https://github.com/devnullvoid/mcp-ssh-session"
+Issues = "https://github.com/devnullvoid/mcp-ssh-session/issues"
 
 [build-system]
 requires = ["hatchling"]

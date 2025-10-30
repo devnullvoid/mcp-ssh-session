@@ -24,6 +24,12 @@ This MCP server provides tools for AI agents to:
 
 ## Installation
 
+Using `uvx`:
+
+```bash
+uvx mcp-ssh-session
+```
+
 Using `uv`:
 
 ```bash
@@ -37,7 +43,7 @@ uv pip install -e .
 ### Running the Server
 
 ```bash
-python -m mcp_ssh_session
+uvx mcp-ssh-session
 ```
 
 ### Available Tools
@@ -185,7 +191,7 @@ The project uses Python 3.10+ and is structured as a standard Python package.
 
 ## License
 
-[Add license information]
+Distributed under the MIT License. See `LICENSE` for details.
 
 ## Contributing
 

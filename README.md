@@ -15,6 +15,12 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 
 ## Installation
 
+### Using `uvx`
+
+```bash
+uvx mcp-ssh-session
+```
+
 ### Using Claude Code
 
 Add to your `~/.claude.json`:
@@ -25,19 +31,17 @@ Add to your `~/.claude.json`:
     "ssh-session": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["uvx git+https://github.com/devnullvoid/mcp-ssh-session.git"],
+      "args": ["mcp-ssh-session"],
       "env": {}
     }
   }
 }
 ```
 
-Replace `/path/to/mcp-ssh-session` with the actual path to this project.
-
 ### Using MCP Inspector
 
 ```bash
-npx @modelcontextprotocol/inspector uvx --from /path/to/mcp-ssh-session mcp-ssh-session
+npx @modelcontextprotocol/inspector uvx mcp-ssh-session
 ```
 
 ### Development Installation
@@ -175,4 +179,4 @@ See [CLAUDE.md](CLAUDE.md) for detailed documentation.
 
 ## License
 
-[Add license information]
+Distributed under the MIT License. See `LICENSE` for details.
