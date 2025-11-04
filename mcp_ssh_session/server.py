@@ -118,8 +118,27 @@ def read_file(
     encoding: str = "utf-8",
     errors: str = "replace",
     max_bytes: Optional[int] = None,
+    sudo_password: Optional[str] = None,
+    use_sudo: bool = False,
 ) -> str:
-    """Read a remote file over SSH."""
+    """Read a remote file over SSH.
+    
+    Attempts to read using SFTP first. If permission is denied and use_sudo is True
+    or sudo_password is provided, falls back to using 'sudo cat' via shell command.
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        remote_path: Path to the remote file
+        username: SSH username (optional)
+        password: SSH password (optional)
+        key_filename: Path to SSH key file (optional)
+        port: SSH port (optional)
+        encoding: Text encoding (default: utf-8)
+        errors: Error handling for decoding (default: replace)
+        max_bytes: Maximum bytes to read (default: 2MB)
+        sudo_password: Password for sudo (optional, not needed if NOPASSWD configured)
+        use_sudo: Use sudo for reading (tries passwordless if no sudo_password provided)
+    """
     content, stderr, exit_status = session_manager.read_file(
         host=host,
         remote_path=remote_path,
@@ -130,6 +149,8 @@ def read_file(
         encoding=encoding,
         errors=errors,
         max_bytes=max_bytes,
+        sudo_password=sudo_password,
+        use_sudo=use_sudo,
     )
 
     result = f"Exit Status: {exit_status}\n\n"
@@ -155,8 +176,31 @@ def write_file(
     make_dirs: bool = False,
     permissions: Optional[int] = None,
     max_bytes: Optional[int] = None,
+    sudo_password: Optional[str] = None,
+    use_sudo: bool = False,
 ) -> str:
-    """Write content to a remote file over SSH."""
+    """Write content to a remote file over SSH.
+    
+    If use_sudo is True or sudo_password is provided, uses sudo via shell commands (tee).
+    Otherwise, attempts to write using SFTP.
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        remote_path: Path to the remote file
+        content: Content to write
+        username: SSH username (optional)
+        password: SSH password (optional)
+        key_filename: Path to SSH key file (optional)
+        port: SSH port (optional)
+        encoding: Text encoding (default: utf-8)
+        errors: Error handling for encoding (default: strict)
+        append: Append to file instead of overwriting (default: False)
+        make_dirs: Create parent directories if they don't exist (default: False)
+        permissions: Octal file permissions to set (e.g., 420 for 0644)
+        max_bytes: Maximum bytes to write (default: 2MB)
+        sudo_password: Password for sudo (optional, not needed if NOPASSWD configured)
+        use_sudo: Use sudo for writing (tries passwordless if no sudo_password provided)
+    """
     message, stderr, exit_status = session_manager.write_file(
         host=host,
         remote_path=remote_path,
@@ -171,6 +215,8 @@ def write_file(
         make_dirs=make_dirs,
         permissions=permissions,
         max_bytes=max_bytes,
+        sudo_password=sudo_password,
+        use_sudo=use_sudo,
     )
 
     result = f"Exit Status: {exit_status}\n\n"

@@ -115,8 +115,9 @@ Close a specific SSH session.
 Close all active SSH sessions.
 
 #### `read_file`
-Read the contents of a remote file via SFTP.
+Read the contents of a remote file via SFTP, with optional sudo support.
 
+**Basic usage:**
 ```json
 {
   "host": "myserver",
@@ -125,13 +126,34 @@ Read the contents of a remote file via SFTP.
 }
 ```
 
-- Uses persistent SSH sessions and opens short-lived SFTP channels
+**With passwordless sudo (NOPASSWD in sudoers):**
+```json
+{
+  "host": "myserver",
+  "remote_path": "/etc/shadow",
+  "use_sudo": true
+}
+```
+
+**With sudo password:**
+```json
+{
+  "host": "myserver",
+  "remote_path": "/etc/shadow",
+  "sudo_password": "user_password"
+}
+```
+
+- Attempts SFTP first for best performance
+- Falls back to `sudo cat` via shell if permission denied and `use_sudo=true` or `sudo_password` provided
+- Supports both passwordless sudo (NOPASSWD) and password-based sudo
 - Enforces a 2 MB maximum per request (configurable per call up to that limit)
 - Returns truncated notice when the content size exceeds the requested limit
 
 #### `write_file`
-Write text content to a remote file via SFTP.
+Write text content to a remote file via SFTP, with optional sudo support.
 
+**Basic usage:**
 ```json
 {
   "host": "myserver",
@@ -142,10 +164,36 @@ Write text content to a remote file via SFTP.
 }
 ```
 
+**With passwordless sudo (NOPASSWD in sudoers):**
+```json
+{
+  "host": "myserver",
+  "remote_path": "/etc/nginx/nginx.conf",
+  "content": "server { ... }",
+  "use_sudo": true,
+  "permissions": 420
+}
+```
+
+**With sudo password:**
+```json
+{
+  "host": "myserver",
+  "remote_path": "/etc/nginx/nginx.conf",
+  "content": "server { ... }",
+  "sudo_password": "user_password",
+  "permissions": 420
+}
+```
+
+- Uses SFTP when `use_sudo=false` and no `sudo_password` provided
+- Uses `sudo tee` via shell when `use_sudo=true` or `sudo_password` is provided
+- Supports both passwordless sudo (NOPASSWD) and password-based sudo
 - Content larger than 2 MB is rejected for safety
 - Optional `append` mode to add to existing files
 - Optional `make_dirs` flag will create missing parent directories
 - Supports `permissions` to set octal file modes after write (e.g., `420` for `0644`)
+- Note: Shell fallback is slower than SFTP but enables writing to protected files
 
 ## SSH Config Support
 
