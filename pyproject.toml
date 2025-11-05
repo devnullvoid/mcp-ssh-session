@@ -1,6 +1,6 @@
 [project]
 name = "mcp-ssh-session"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for managing persistent SSH sessions"
 requires-python = ">=3.10"
 readme = "README.md"
