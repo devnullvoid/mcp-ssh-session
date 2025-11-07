@@ -2,6 +2,10 @@
 
 An MCP (Model Context Protocol) server that enables AI agents to establish and manage persistent SSH sessions.
 
+<a href="https://glama.ai/mcp/servers/@devnullvoid/mcp-ssh-session">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@devnullvoid/mcp-ssh-session/badge" alt="SSH Session MCP server" />
+</a>
+
 ## Features
 
 - **Persistent Sessions**: SSH connections are reused across multiple command executions
