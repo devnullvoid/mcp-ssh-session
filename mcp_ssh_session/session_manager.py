@@ -194,6 +194,7 @@ class SSHSessionManager:
         self._command_validator = CommandValidator()
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS, thread_name_prefix="ssh_cmd")
         self._active_channels: Dict[str, Any] = {}  # Track active channels for cleanup
+        self._max_completed_commands = 100  # Keep last 100 completed commands
 
         # Setup logging
         log_dir = Path('/tmp/mcp_ssh_session_logs')
@@ -1076,8 +1077,7 @@ class SSHSessionManager:
                        timeout: int = 30) -> tuple[str, str, int]:
         """Execute a command on a host using persistent session.
         
-        Starts synchronously and waits for completion. If timeout is reached,
-        automatically transitions to async mode and returns a command ID.
+        All commands execute async internally. This polls until completion or timeout.
 
         Args:
             host: Hostname or SSH config alias
@@ -1093,68 +1093,33 @@ class SSHSessionManager:
             
         Returns:
             Tuple of (stdout, stderr, exit_code)
-            If timeout reached, returns ("", "ASYNC: command_id", 124)
+            If timeout reached, returns ("", "ASYNC:command_id", 124)
         """
-        logger = self.logger.getChild('execute_command')
-        logger.info(f"Executing command on {host}: {command}")
-
-        # Validate command for safety
+        # Validate command
         is_valid, error_msg = self._command_validator.validate_command(command)
         if not is_valid:
-            logger.warning(f"Command validation failed: {error_msg}")
             return "", error_msg, 1
 
-        # Enforce timeout limits
-        timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
-        logger.debug(f"Using timeout: {timeout} seconds")
-        
-        _, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
-            host, username, port
+        # Start async
+        command_id = self.execute_command_async(
+            host, username, command, password, key_filename, port,
+            sudo_password, enable_password, enable_command, timeout
         )
 
-        client = self.get_or_create_session(host, username, password, key_filename, port)
-        shell = self._get_or_create_shell(session_key, client)
+        # Poll until done or timeout
+        start = time.time()
+        while time.time() - start < timeout:
+            status = self.get_command_status(command_id)
+            if status['status'] != 'running':
+                # Cleanup and return
+                with self._lock:
+                    if command_id in self._running_commands:
+                        del self._running_commands[command_id]
+                return status['stdout'], status['stderr'], status['exit_code'] or 0
+            time.sleep(0.1)
 
-        # Start command in async mode
-        command_id = str(uuid.uuid4())
-        running_cmd = RunningCommand(
-            command_id=command_id,
-            session_key=session_key,
-            command=command,
-            shell=shell,
-            future=None,
-            status=CommandStatus.RUNNING,
-            stdout="",
-            stderr="",
-            exit_code=None,
-            start_time=datetime.now(),
-            end_time=None
-        )
-
-        with self._lock:
-            self._running_commands[command_id] = running_cmd
-
-        future = self._executor.submit(
-            self._execute_command_async_worker,
-            command_id, client, command, timeout, session_key,
-            sudo_password, enable_password, enable_command
-        )
-        running_cmd.future = future
-
-        # Wait for completion up to timeout
-        try:
-            future.result(timeout=timeout)
-            # Command completed within timeout
-            with self._lock:
-                cmd = self._running_commands[command_id]
-                result = (cmd.stdout, cmd.stderr, cmd.exit_code or 0)
-                # Clean up completed command
-                del self._running_commands[command_id]
-                return result
-        except FuturesTimeoutError:
-            # Timeout reached - transition to async mode
-            logger.info(f"Command timeout reached, transitioning to async mode: {command_id}")
-            return "", f"ASYNC:{command_id}", 124
+        # Timeout - return command ID
+        return "", f"ASYNC:{command_id}", 124
 
     def interrupt_command(self, host: str, username: Optional[str] = None, port: Optional[int] = None) -> tuple[bool, str]:
         """Interrupt a running command on a session by sending Ctrl+C."""
@@ -1169,13 +1134,6 @@ class SSHSessionManager:
                     return False, f"Failed to send interrupt signal to session {session_key}: {e}"
             else:
                 return False, f"No active command found for session {session_key}"
-
-    def get_active_commands(self) -> dict[str, str]:
-        """Get a dictionary of active commands and their session keys."""
-        with self._lock:
-            # This is a simplification. We can't easily get the command text.
-            # For now, we'll just indicate that a command is active.
-            return {session_key: "active" for session_key in self._active_commands.keys()}
 
     def _execute_command_async_worker(self, command_id: str, client: paramiko.SSHClient,
                                        command: str, timeout: int, session_key: str,
@@ -1213,6 +1171,9 @@ class SSHSessionManager:
                 running_cmd.exit_code = 1
                 running_cmd.status = CommandStatus.FAILED
                 running_cmd.end_time = datetime.now()
+        finally:
+            # Cleanup old commands
+            self._cleanup_old_commands()
 
     def execute_command_async(self, host: str, username: Optional[str] = None,
                              command: str = "", password: Optional[str] = None,
@@ -1314,3 +1275,17 @@ class SSHSessionManager:
                 }
                 for cmd in self._running_commands.values()
             ]
+
+    def _cleanup_old_commands(self):
+        """Remove old completed commands, keeping only recent ones."""
+        with self._lock:
+            completed = [
+                (cmd_id, cmd) for cmd_id, cmd in self._running_commands.items()
+                if cmd.status in [CommandStatus.COMPLETED, CommandStatus.FAILED, CommandStatus.INTERRUPTED]
+            ]
+            if len(completed) > self._max_completed_commands:
+                # Sort by end time, remove oldest
+                completed.sort(key=lambda x: x[1].end_time or datetime.min)
+                to_remove = completed[:-self._max_completed_commands]
+                for cmd_id, _ in to_remove:
+                    del self._running_commands[cmd_id]

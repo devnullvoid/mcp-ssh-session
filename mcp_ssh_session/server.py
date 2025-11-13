@@ -249,16 +249,6 @@ def interrupt_command(host: str, username: Optional[str] = None, port: Optional[
 
 
 @mcp.tool()
-def get_active_commands() -> str:
-    """Get a list of active commands and their sessions."""
-    active_commands = session_manager.get_active_commands()
-    if active_commands:
-        return "Active Commands:\n" + "\n".join(f"- {session}: {command}" for session, command in active_commands.items())
-    else:
-        return "No active commands"
-
-
-@mcp.tool()
 def execute_command_async(
     host: str,
     command: str,

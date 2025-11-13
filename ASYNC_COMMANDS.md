@@ -2,11 +2,12 @@
 
 ## Overview
 
-Commands now use **smart execution** that never hangs the server:
-- Starts synchronously, waits for completion
-- If timeout reached, transitions to async mode
-- Returns command ID, continues in background
-- **Server never hangs**
+**All commands execute asynchronously** - the server never hangs:
+- Every command runs in a background thread
+- `execute_command` polls until done or timeout
+- `execute_command_async` returns command ID immediately
+- Completed commands auto-cleanup (keeps last 100)
+- **Server always responsive**
 
 ## Quick Start
 
@@ -125,9 +126,10 @@ else:
 
 ## Technical Details
 
-- Commands run in ThreadPoolExecutor (max 10 concurrent)
-- Uses Future.result() with timeout
+- All commands run in ThreadPoolExecutor (max 10 concurrent)
+- `execute_command` polls status every 0.1s until done or timeout
 - On timeout, returns command ID and continues in background
 - Exit code 124 indicates async transition
 - Output limited to 10MB per command
+- Auto-cleanup keeps last 100 completed commands
 - State tracked in memory (lost on server restart)
