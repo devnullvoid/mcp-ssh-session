@@ -4,7 +4,9 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 
 ## Features
 
+- **Smart Command Execution**: Never hangs the server - automatically transitions to async mode if timeout is reached
 - **Persistent Sessions**: SSH connections are reused across multiple command executions
+- **Async Command Execution**: Non-blocking execution for long-running commands
 - **SSH Config Support**: Automatically reads and uses settings from `~/.ssh/config`
 - **Multi-host Support**: Manage connections to multiple hosts simultaneously
 - **Automatic Reconnection**: Dead connections are detected and automatically re-established
@@ -12,6 +14,7 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 - **Network Device Support**: Automatic enable mode handling for routers and switches
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 - **File Operations**: Safe helpers to read and write remote files over SFTP
+- **Command Interruption**: Send Ctrl+C to interrupt running commands
 
 ## Installation
 
@@ -58,6 +61,8 @@ uv pip install -e .
 
 #### `execute_command`
 Execute a command on an SSH host using a persistent session.
+
+**Smart Execution**: Starts synchronously and waits for completion. If timeout is reached, automatically transitions to async mode and returns a command ID. Server never hangs!
 
 **Using SSH config alias:**
 ```json
@@ -113,6 +118,38 @@ Close a specific SSH session.
 
 #### `close_all_sessions`
 Close all active SSH sessions.
+
+#### `execute_command_async`
+Execute a command asynchronously without blocking the server. Returns a command ID for tracking.
+
+```json
+{
+  "host": "myserver",
+  "command": "sleep 60 && echo 'Done'",
+  "timeout": 300
+}
+```
+
+#### `get_command_status`
+Get the status and output of an async command.
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+#### `interrupt_command_by_id`
+Interrupt a running async command by sending Ctrl+C.
+
+```json
+{
+  "command_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+#### `list_running_commands`
+List all currently running async commands.
 
 #### `read_file`
 Read the contents of a remote file via SFTP, with optional sudo support.
@@ -223,7 +260,8 @@ Then simply use:
 
 ## Documentation
 
-See [CLAUDE.md](CLAUDE.md) for detailed documentation.
+- [ASYNC_COMMANDS.md](ASYNC_COMMANDS.md) - Smart execution and async commands
+- [CLAUDE.md](CLAUDE.md) - Detailed usage documentation
 
 ## License
 

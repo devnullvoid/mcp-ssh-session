@@ -12,6 +12,10 @@ import signal
 import posixpath
 import stat
 import shlex
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+from datetime import datetime
 
 
 class CommandValidator:
@@ -47,7 +51,7 @@ class CommandValidator:
         r'^telnet\s',  # telnet at start
         r'\|\s*telnet\s',  # telnet in pipeline
         r'^tcpdump\b',  # tcpdump at start
-        r'\|\s*tcpdump\b',  # tcpdump in pipeline
+        r'\|\s*tcpdump\b',
         r'\bping\s+(?!.*-c\s+\d+)',  # ping without count flag
         r'^monitor\s',  # Network device monitor commands at start
         r'^debug\s',  # Debug commands at start
@@ -141,6 +145,28 @@ class OutputLimiter:
         return chunk, True
 
 
+class CommandStatus(Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
+    FAILED = "failed"
+
+
+@dataclass
+class RunningCommand:
+    command_id: str
+    session_key: str
+    command: str
+    shell: Any
+    future: Any
+    status: CommandStatus
+    stdout: str
+    stderr: str
+    exit_code: Optional[int]
+    start_time: datetime
+    end_time: Optional[datetime]
+
+
 class SSHSessionManager:
     """Manages persistent SSH sessions with safety protections."""
 
@@ -161,6 +187,8 @@ class SSHSessionManager:
         self._sessions: Dict[str, paramiko.SSHClient] = {}
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
+        self._active_commands: Dict[str, Any] = {} # Track active command shells
+        self._running_commands: Dict[str, RunningCommand] = {}  # Track async commands by ID
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
         self._command_validator = CommandValidator()
@@ -313,7 +341,7 @@ class SSHSessionManager:
                     logger.debug(f"[ENABLE_MODE] Received chunk: {chunk!r}")
 
                     # Check for password prompt or already in enable mode
-                    if re.search(r'[Pp]assword:', output) or '#' in output:
+                    if re.search(r'[Pp]assword:|password.*:', output) or '#' in output:
                         if '#' in output:
                             logger.debug("[ENABLE_MODE] Already in enable mode")
                             self._enable_mode[session_key] = True
@@ -383,7 +411,7 @@ class SSHSessionManager:
             except:
                 pass
             del self._session_shells[session_key]
-        
+
         if session_key in self._sessions:
             try:
                 self._sessions[session_key].close()
@@ -394,7 +422,7 @@ class SSHSessionManager:
         if session_key in self._enable_mode:
             del self._enable_mode[session_key]
 
-    def close_all(self):
+    def close_all_sessions(self):
         """Close all sessions and cleanup resources."""
         with self._lock:
             # Close all persistent shells
@@ -404,7 +432,7 @@ class SSHSessionManager:
                 except:
                     pass
             self._session_shells.clear()
-            
+
             # Close all active channels
             for channel_id in list(self._active_channels.keys()):
                 try:
@@ -430,7 +458,7 @@ class SSHSessionManager:
     def __del__(self):
         """Cleanup when the session manager is destroyed."""
         try:
-            self.close_all()
+            self.close_all_sessions()
         except:
             pass
 
@@ -729,7 +757,7 @@ class SSHSessionManager:
             except:
                 if session_key in self._session_shells:
                     del self._session_shells[session_key]
-        
+
         # Create new shell
         shell = client.invoke_shell()
         time.sleep(0.5)
@@ -743,10 +771,13 @@ class SSHSessionManager:
                                            timeout: int, session_key: str) -> tuple[str, str, int]:
         """Internal method to execute a standard SSH command using persistent shell."""
         logger = self.logger.getChild('standard_command')
-
+        shell = None
         try:
             shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
+
+            with self._lock:
+                self._active_commands[session_key] = shell
 
             # Send command
             shell.send(command + '\n')
@@ -762,11 +793,11 @@ class SSHSessionManager:
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     output += limited_chunk
-                    
+
                     if not should_continue:
                         logger.warning(f"Output size limit exceeded")
                         break
-                    
+
                     # Check for prompt (command completed)
                     lines = output.split('\n')
                     if len(lines) > 1 and lines[-1].strip().endswith(('$', '#', '>', '%')):
@@ -801,6 +832,11 @@ class SSHSessionManager:
                     pass
                 del self._session_shells[session_key]
             return "", f"Error: {str(e)}", 1
+        finally:
+            with self._lock:
+                if session_key in self._active_commands:
+                    del self._active_commands[session_key]
+
 
     def read_file(self, host: str, remote_path: str, username: Optional[str] = None,
                   password: Optional[str] = None, key_filename: Optional[str] = None,
@@ -808,7 +844,7 @@ class SSHSessionManager:
                   errors: str = "replace", max_bytes: Optional[int] = None,
                   sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
         """Read a remote file over SSH using SFTP, with optional sudo fallback.
-        
+
         Args:
             sudo_password: Password for sudo (optional, not needed if NOPASSWD configured)
             use_sudo: If True, use sudo for reading (tries passwordless first if no sudo_password)
@@ -881,16 +917,16 @@ class SSHSessionManager:
             logger.info(f"SFTP permission denied, falling back to sudo cat for {remote_path}")
             # Use head to limit output size
             cmd = f"sudo cat {shlex.quote(remote_path)} | head -c {byte_limit}"
-            
+
             if sudo_password:
                 stdout, stderr, exit_code = self._execute_sudo_command(client, cmd, sudo_password, timeout=30)
             else:
                 # Try passwordless sudo
                 stdout, stderr, exit_code = self._execute_standard_command_internal(client, cmd, 30, session_key)
-            
+
             if exit_code != 0:
                 return "", f"Permission denied and sudo failed: {stderr}", exit_code
-            
+
             # Check if output was truncated
             truncated = len(stdout.encode('utf-8')) >= byte_limit
             if truncated:
@@ -898,11 +934,11 @@ class SSHSessionManager:
                 stderr_msg = f"Content truncated to {byte_limit} bytes. Increase max_bytes to retrieve full file."
             else:
                 stderr_msg = ""
-            
+
             return stdout, stderr_msg, 0
         elif permission_denied:
             return "", "Permission denied reading file. Set use_sudo=True or provide sudo_password to retry with sudo.", 1
-        
+
         return "", "Unexpected error in read_file", 1
 
     def write_file(self, host: str, remote_path: str, content: str,
@@ -914,7 +950,7 @@ class SSHSessionManager:
                    max_bytes: Optional[int] = None,
                    sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
         """Write content to a remote file over SSH using SFTP, with optional sudo fallback.
-        
+
         Args:
             sudo_password: Password for sudo (optional, not needed if NOPASSWD configured)
             use_sudo: If True, use sudo for writing (tries passwordless first if no sudo_password)
@@ -983,17 +1019,17 @@ class SSHSessionManager:
                         sftp.close()
                     except Exception:
                         pass
-        
+
         # Use sudo shell commands
         logger.info(f"Using sudo to write {remote_path}")
-        
+
         # Helper to execute with or without password
         def exec_sudo(cmd: str) -> tuple[str, str, int]:
             if sudo_password:
                 return self._execute_sudo_command(client, cmd, sudo_password, timeout=30)
             else:
                 return self._execute_standard_command_internal(client, cmd, 30, session_key)
-        
+
         # Create parent directories if needed
         if make_dirs:
             directory = posixpath.dirname(remote_path)
@@ -1002,27 +1038,27 @@ class SSHSessionManager:
                 _, stderr, exit_code = exec_sudo(mkdir_cmd)
                 if exit_code != 0:
                     return "", f"Failed to create directories: {stderr}", exit_code
-        
+
         # Write content using tee (supports both write and append)
-        escaped_content = content.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
-        
+        escaped_content = content.replace('\\', '\\\\').replace('"', '\"').replace('$', r'\$').replace('`', r'\`')
+
         if append:
             cmd = f'echo -n "{escaped_content}" | sudo tee -a {shlex.quote(remote_path)} > /dev/null'
         else:
             cmd = f'echo -n "{escaped_content}" | sudo tee {shlex.quote(remote_path)} > /dev/null'
-        
+
         stdout, stderr, exit_code = exec_sudo(cmd)
-        
+
         if exit_code != 0:
             return "", f"Failed to write file with sudo: {stderr}", exit_code
-        
+
         # Set permissions if specified
         if permissions is not None:
             chmod_cmd = f"sudo chmod {oct(permissions)[2:]} {shlex.quote(remote_path)}"
             _, stderr, exit_code = exec_sudo(chmod_cmd)
             if exit_code != 0:
                 logger.warning(f"Failed to set permissions: {stderr}")
-        
+
         message = f"Wrote {len(data)} bytes to {remote_path} using sudo"
         if append:
             message += " (append)"
@@ -1039,6 +1075,9 @@ class SSHSessionManager:
                        sudo_password: Optional[str] = None,
                        timeout: int = 30) -> tuple[str, str, int]:
         """Execute a command on a host using persistent session.
+        
+        Starts synchronously and waits for completion. If timeout is reached,
+        automatically transitions to async mode and returns a command ID.
 
         Args:
             host: Hostname or SSH config alias
@@ -1051,6 +1090,10 @@ class SSHSessionManager:
             enable_command: Command to enter enable mode (default: "enable")
             sudo_password: Password for sudo commands on Unix/Linux hosts (optional)
             timeout: Timeout in seconds for command execution (default: 30)
+            
+        Returns:
+            Tuple of (stdout, stderr, exit_code)
+            If timeout reached, returns ("", "ASYNC: command_id", 124)
         """
         logger = self.logger.getChild('execute_command')
         logger.info(f"Executing command on {host}: {command}")
@@ -1064,28 +1107,210 @@ class SSHSessionManager:
         # Enforce timeout limits
         timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
         logger.debug(f"Using timeout: {timeout} seconds")
-        # Get SSH config for this host
+        
         _, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
             host, username, port
         )
 
         client = self.get_or_create_session(host, username, password, key_filename, port)
+        shell = self._get_or_create_shell(session_key, client)
 
-        # Handle sudo commands for Unix/Linux hosts
-        if sudo_password:
-            return self._execute_sudo_command(client, command, sudo_password, timeout)
+        # Start command in async mode
+        command_id = str(uuid.uuid4())
+        running_cmd = RunningCommand(
+            command_id=command_id,
+            session_key=session_key,
+            command=command,
+            shell=shell,
+            future=None,
+            status=CommandStatus.RUNNING,
+            stdout="",
+            stderr="",
+            exit_code=None,
+            start_time=datetime.now(),
+            end_time=None
+        )
 
-        # Handle enable mode for network devices
-        if enable_password:
-            return self._execute_with_thread_timeout(
-                self._execute_enable_mode_command_internal,
-                timeout,
-                client, session_key, command, enable_password, enable_command, timeout
-            )
-        else:
-            # Standard exec_command for regular SSH hosts
-            return self._execute_with_thread_timeout(
-                self._execute_standard_command_internal,
-                timeout,
-                client, command, timeout, session_key
-            )
+        with self._lock:
+            self._running_commands[command_id] = running_cmd
+
+        future = self._executor.submit(
+            self._execute_command_async_worker,
+            command_id, client, command, timeout, session_key,
+            sudo_password, enable_password, enable_command
+        )
+        running_cmd.future = future
+
+        # Wait for completion up to timeout
+        try:
+            future.result(timeout=timeout)
+            # Command completed within timeout
+            with self._lock:
+                cmd = self._running_commands[command_id]
+                result = (cmd.stdout, cmd.stderr, cmd.exit_code or 0)
+                # Clean up completed command
+                del self._running_commands[command_id]
+                return result
+        except FuturesTimeoutError:
+            # Timeout reached - transition to async mode
+            logger.info(f"Command timeout reached, transitioning to async mode: {command_id}")
+            return "", f"ASYNC:{command_id}", 124
+
+    def interrupt_command(self, host: str, username: Optional[str] = None, port: Optional[int] = None) -> tuple[bool, str]:
+        """Interrupt a running command on a session by sending Ctrl+C."""
+        _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        with self._lock:
+            if session_key in self._active_commands:
+                shell = self._active_commands[session_key]
+                try:
+                    shell.send('\x03')  # Send Ctrl+C
+                    return True, f"Sent interrupt signal (Ctrl+C) to session {session_key}"
+                except Exception as e:
+                    return False, f"Failed to send interrupt signal to session {session_key}: {e}"
+            else:
+                return False, f"No active command found for session {session_key}"
+
+    def get_active_commands(self) -> dict[str, str]:
+        """Get a dictionary of active commands and their session keys."""
+        with self._lock:
+            # This is a simplification. We can't easily get the command text.
+            # For now, we'll just indicate that a command is active.
+            return {session_key: "active" for session_key in self._active_commands.keys()}
+
+    def _execute_command_async_worker(self, command_id: str, client: paramiko.SSHClient,
+                                       command: str, timeout: int, session_key: str,
+                                       sudo_password: Optional[str] = None,
+                                       enable_password: Optional[str] = None,
+                                       enable_command: str = "enable"):
+        """Execute command in background thread and update running command state."""
+        logger = self.logger.getChild('async_worker')
+        running_cmd = self._running_commands[command_id]
+        
+        try:
+            if sudo_password:
+                stdout, stderr, exit_code = self._execute_sudo_command_internal(
+                    client, command, sudo_password, timeout
+                )
+            elif enable_password:
+                stdout, stderr, exit_code = self._execute_enable_mode_command_internal(
+                    client, session_key, command, enable_password, enable_command, timeout
+                )
+            else:
+                stdout, stderr, exit_code = self._execute_standard_command_internal(
+                    client, command, timeout, session_key
+                )
+            
+            with self._lock:
+                running_cmd.stdout = stdout
+                running_cmd.stderr = stderr
+                running_cmd.exit_code = exit_code
+                running_cmd.status = CommandStatus.COMPLETED
+                running_cmd.end_time = datetime.now()
+        except Exception as e:
+            logger.error(f"Command {command_id} failed: {e}")
+            with self._lock:
+                running_cmd.stderr = str(e)
+                running_cmd.exit_code = 1
+                running_cmd.status = CommandStatus.FAILED
+                running_cmd.end_time = datetime.now()
+
+    def execute_command_async(self, host: str, username: Optional[str] = None,
+                             command: str = "", password: Optional[str] = None,
+                             key_filename: Optional[str] = None,
+                             port: Optional[int] = None,
+                             sudo_password: Optional[str] = None,
+                             enable_password: Optional[str] = None,
+                             enable_command: str = "enable",
+                             timeout: int = 300) -> str:
+        """Execute a command asynchronously without blocking.
+        
+        Returns a command ID that can be used to check status and retrieve output.
+        """
+        logger = self.logger.getChild('execute_async')
+        logger.info(f"Starting async command on {host}: {command}")
+
+        _, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
+            host, username, port
+        )
+
+        client = self.get_or_create_session(host, username, password, key_filename, port)
+        shell = self._get_or_create_shell(session_key, client)
+
+        command_id = str(uuid.uuid4())
+        
+        running_cmd = RunningCommand(
+            command_id=command_id,
+            session_key=session_key,
+            command=command,
+            shell=shell,
+            future=None,
+            status=CommandStatus.RUNNING,
+            stdout="",
+            stderr="",
+            exit_code=None,
+            start_time=datetime.now(),
+            end_time=None
+        )
+
+        with self._lock:
+            self._running_commands[command_id] = running_cmd
+
+        future = self._executor.submit(
+            self._execute_command_async_worker,
+            command_id, client, command, timeout, session_key,
+            sudo_password, enable_password, enable_command
+        )
+        running_cmd.future = future
+
+        return command_id
+
+    def get_command_status(self, command_id: str) -> dict:
+        """Get the status and output of an async command."""
+        with self._lock:
+            if command_id not in self._running_commands:
+                return {"error": "Command ID not found"}
+            
+            cmd = self._running_commands[command_id]
+            return {
+                "command_id": cmd.command_id,
+                "session_key": cmd.session_key,
+                "command": cmd.command,
+                "status": cmd.status.value,
+                "stdout": cmd.stdout,
+                "stderr": cmd.stderr,
+                "exit_code": cmd.exit_code,
+                "start_time": cmd.start_time.isoformat(),
+                "end_time": cmd.end_time.isoformat() if cmd.end_time else None
+            }
+
+    def interrupt_command_by_id(self, command_id: str) -> tuple[bool, str]:
+        """Interrupt a running async command by its ID."""
+        with self._lock:
+            if command_id not in self._running_commands:
+                return False, f"Command ID {command_id} not found"
+            
+            cmd = self._running_commands[command_id]
+            if cmd.status != CommandStatus.RUNNING:
+                return False, f"Command {command_id} is not running (status: {cmd.status.value})"
+            
+            try:
+                cmd.shell.send('\x03')  # Send Ctrl+C
+                cmd.status = CommandStatus.INTERRUPTED
+                cmd.end_time = datetime.now()
+                return True, f"Sent interrupt signal to command {command_id}"
+            except Exception as e:
+                return False, f"Failed to interrupt command {command_id}: {e}"
+
+    def list_running_commands(self) -> list[dict]:
+        """List all running async commands."""
+        with self._lock:
+            return [
+                {
+                    "command_id": cmd.command_id,
+                    "session_key": cmd.session_key,
+                    "command": cmd.command,
+                    "status": cmd.status.value,
+                    "start_time": cmd.start_time.isoformat()
+                }
+                for cmd in self._running_commands.values()
+            ]

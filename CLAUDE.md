@@ -21,6 +21,7 @@ This MCP server provides tools for AI agents to:
 - **Network Device Support**: Automatic enable mode handling for routers and switches (Cisco, Juniper, etc.)
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 - **Interactive Shell Handling**: Detects and responds to password prompts automatically
+- **Command Interruption**: Allows for gracefully stopping long-running or stuck commands by sending a Ctrl+C signal to the active session
 
 ## Installation
 
@@ -121,6 +122,19 @@ execute_command(
 )
 ```
 
+#### `interrupt_command`
+Interrupt a running command on a session by sending a Ctrl+C signal. This is useful for stopping commands that are taking too long to execute or are stuck in an input loop.
+
+**Parameters:**
+- `host` (str): Hostname or IP address
+- `username` (str): SSH username
+- `port` (int, default=22): SSH port
+
+#### `get_active_commands`
+List all commands that are currently executing in active sessions.
+
+**Returns:** A list of active commands and the sessions they are running in.
+
 #### `list_sessions`
 List all active SSH sessions.
 
@@ -163,6 +177,7 @@ The core session management class that:
 - Falls back to sensible defaults when config is not available
 - Handles interactive prompts for enable mode and sudo authentication
 - Tracks enable mode state per session to avoid re-authentication
+- Tracks active commands and provides a mechanism to interrupt them by sending a Ctrl+C signal
 - Uses `exec_command()` for standard SSH hosts and `invoke_shell()` for interactive scenarios
 
 ### MCP Server

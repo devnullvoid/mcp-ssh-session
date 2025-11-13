@@ -23,6 +23,10 @@ def execute_command(
     timeout: int = 30
 ) -> str:
     """Execute a command on an SSH host using a persistent session.
+    
+    Starts synchronously and waits for completion. If the command doesn't complete
+    within the timeout, it automatically transitions to async mode and returns a
+    command ID for tracking.
 
     The host parameter can be either a hostname/IP or an SSH config alias.
     If an SSH config alias is provided, configuration will be read from ~/.ssh/config.
@@ -58,6 +62,16 @@ def execute_command(
         sudo_password=sudo_password,
         timeout=timeout,
     )
+
+    # Check if command transitioned to async mode
+    if exit_status == 124 and stderr.startswith("ASYNC:"):
+        command_id = stderr.split(":", 1)[1]
+        return (
+            f"Command exceeded timeout of {timeout}s and is now running in background.\n\n"
+            f"Command ID: {command_id}\n\n"
+            f"Use get_command_status('{command_id}') to check progress.\n"
+            f"Use interrupt_command_by_id('{command_id}') to stop it."
+        )
 
     result = f"Exit Status: {exit_status}\n\n"
     if stdout:
@@ -103,7 +117,7 @@ def close_session(host: str, username: Optional[str] = None, port: Optional[int]
 @mcp.tool()
 def close_all_sessions() -> str:
     """Close all active SSH sessions."""
-    session_manager.close_all()
+    session_manager.close_all_sessions()
     return "All SSH sessions closed"
 
 
@@ -224,4 +238,116 @@ def write_file(
         result += f"MESSAGE:\n{message}\n"
     if stderr:
         result += f"STDERR:\n{stderr}\n"
+    return result
+
+
+@mcp.tool()
+def interrupt_command(host: str, username: Optional[str] = None, port: Optional[int] = None) -> str:
+    """Interrupt a running command on a session by sending Ctrl+C."""
+    success, message = session_manager.interrupt_command(host, username, port)
+    return message
+
+
+@mcp.tool()
+def get_active_commands() -> str:
+    """Get a list of active commands and their sessions."""
+    active_commands = session_manager.get_active_commands()
+    if active_commands:
+        return "Active Commands:\n" + "\n".join(f"- {session}: {command}" for session, command in active_commands.items())
+    else:
+        return "No active commands"
+
+
+@mcp.tool()
+def execute_command_async(
+    host: str,
+    command: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    key_filename: Optional[str] = None,
+    port: Optional[int] = None,
+    timeout: int = 300
+) -> str:
+    """Execute a command asynchronously without blocking the server.
+    
+    Returns a command ID that can be used to check status, retrieve output, or interrupt.
+    Useful for long-running commands like 'sleep 60', monitoring tasks, or large operations.
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        command: Command to execute
+        username: SSH username (optional)
+        password: SSH password (optional)
+        key_filename: Path to SSH key file (optional)
+        port: SSH port (optional)
+        timeout: Maximum execution time in seconds (default: 300)
+    """
+    command_id = session_manager.execute_command_async(
+        host=host,
+        command=command,
+        username=username,
+        password=password,
+        key_filename=key_filename,
+        port=port,
+        timeout=timeout
+    )
+    return f"Command started with ID: {command_id}\n\nUse get_command_status('{command_id}') to check progress."
+
+
+@mcp.tool()
+def get_command_status(command_id: str) -> str:
+    """Get the status and output of an async command.
+    
+    Args:
+        command_id: The command ID returned by execute_command_async
+    """
+    status = session_manager.get_command_status(command_id)
+    
+    if "error" in status:
+        return f"Error: {status['error']}"
+    
+    result = f"Command ID: {status['command_id']}\n"
+    result += f"Session: {status['session_key']}\n"
+    result += f"Command: {status['command']}\n"
+    result += f"Status: {status['status']}\n"
+    result += f"Started: {status['start_time']}\n"
+    if status['end_time']:
+        result += f"Ended: {status['end_time']}\n"
+    if status['exit_code'] is not None:
+        result += f"Exit Code: {status['exit_code']}\n"
+    
+    if status['stdout']:
+        result += f"\nSTDOUT:\n{status['stdout']}\n"
+    if status['stderr']:
+        result += f"\nSTDERR:\n{status['stderr']}\n"
+    
+    return result
+
+
+@mcp.tool()
+def interrupt_command_by_id(command_id: str) -> str:
+    """Interrupt a running async command by sending Ctrl+C.
+    
+    Args:
+        command_id: The command ID returned by execute_command_async
+    """
+    success, message = session_manager.interrupt_command_by_id(command_id)
+    return message
+
+
+@mcp.tool()
+def list_running_commands() -> str:
+    """List all currently running async commands."""
+    commands = session_manager.list_running_commands()
+    if not commands:
+        return "No running commands"
+    
+    result = "Running Commands:\n"
+    for cmd in commands:
+        result += f"\n- ID: {cmd['command_id']}\n"
+        result += f"  Session: {cmd['session_key']}\n"
+        result += f"  Command: {cmd['command']}\n"
+        result += f"  Status: {cmd['status']}\n"
+        result += f"  Started: {cmd['start_time']}\n"
+    
     return result
