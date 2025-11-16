@@ -203,13 +203,13 @@ class SSHSessionManager:
 
         # Configure logger - only log to file, not to stdout (which would send MCP notifications)
         self.logger = logging.getLogger('ssh_session')
-        self.logger.setLevel(logging.INFO)  # Changed to INFO to reduce verbosity
+        self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False  # Don't propagate to root logger
 
         # Only add file handler (no StreamHandler to avoid MCP notifications)
         file_handler = logging.FileHandler(str(log_file))
         file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            '%(asctime)s - [%(threadName)s] - %(name)s - %(levelname)s - %(message)s'
         ))
         self.logger.addHandler(file_handler)
         self.logger.info("SSHSessionManager initialized")
@@ -507,30 +507,13 @@ class SSHSessionManager:
                 sftp.mkdir(directory)
 
     def _execute_with_thread_timeout(self, func, timeout: int, *args, **kwargs) -> Tuple[str, str, int]:
-        """
-        Execute a function with a thread-based timeout.
-
-        This provides a hard timeout that will interrupt even blocking I/O operations.
-
-        Args:
-            func: The function to execute
-            timeout: Timeout in seconds
-            *args, **kwargs: Arguments to pass to the function
-
-        Returns:
-            Tuple of (stdout: str, stderr: str, exit_status: int)
-        """
+        """DEPRECATED - kept for compatibility but not used."""
         logger = self.logger.getChild('thread_timeout')
-
+        logger.debug(f"[DEPRECATED] _execute_with_thread_timeout called")
         try:
-            logger.info(f"Executing with timeout: {timeout}s")
-            # Execute directly without thread pool to avoid hanging the server
-            result = func(*args, **kwargs)
-            logger.debug(f"Command completed successfully")
-            return result
-
+            return func(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Error executing command: {str(e)}", exc_info=True)
+            logger.error(f"Error: {str(e)}", exc_info=True)
             return "", f"Error: {str(e)}", 1
 
     def _execute_sudo_command_internal(self, client: paramiko.SSHClient, command: str,
@@ -747,31 +730,36 @@ class SSHSessionManager:
 
     def _get_or_create_shell(self, session_key: str, client: paramiko.SSHClient) -> Any:
         """Get or create a persistent shell for stateful command execution."""
+        logger = self.logger.getChild('shell')
+        
         if session_key in self._session_shells:
             shell = self._session_shells[session_key]
             try:
-                # Check if shell is still active
                 if shell.closed or not shell.get_transport() or not shell.get_transport().is_active():
+                    logger.debug(f"[SHELL_DEAD] {session_key}")
                     del self._session_shells[session_key]
                 else:
+                    logger.debug(f"[SHELL_REUSE] {session_key}")
                     return shell
             except:
+                logger.debug(f"[SHELL_ERROR] {session_key}")
                 if session_key in self._session_shells:
                     del self._session_shells[session_key]
 
-        # Create new shell
+        logger.debug(f"[SHELL_CREATE] {session_key}")
         shell = client.invoke_shell()
         time.sleep(0.5)
-        # Clear initial output
         if shell.recv_ready():
             shell.recv(4096)
         self._session_shells[session_key] = shell
+        logger.debug(f"[SHELL_READY] {session_key}")
         return shell
 
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
                                            timeout: int, session_key: str) -> tuple[str, str, int]:
         """Internal method to execute a standard SSH command using persistent shell."""
         logger = self.logger.getChild('standard_command')
+        logger.debug(f"[CMD_START] {command[:100]}...")
         shell = None
         try:
             shell = self._get_or_create_shell(session_key, client)
@@ -780,28 +768,35 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
-            # Send command
+            logger.debug(f"[CMD_SEND] Sending command")
             shell.send(command + '\n')
             time.sleep(0.3)
+            logger.debug(f"[CMD_READ] Reading output")
 
             # Read output with size limiting
             output_limiter = OutputLimiter()
             output = ""
             start_time = time.time()
 
+            last_recv_time = start_time
+            idle_timeout = 2.0  # If no data for 2s after receiving some, assume done
+            
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    logger.debug(f"[CMD_CHUNK] Received {len(chunk)} bytes")
+                    last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     output += limited_chunk
 
                     if not should_continue:
-                        logger.warning(f"Output size limit exceeded")
+                        logger.warning(f"[CMD_LIMIT] Output size limit exceeded")
                         break
 
                     # Check for prompt (command completed)
                     lines = output.split('\n')
                     if len(lines) > 1 and lines[-1].strip().endswith(('$', '#', '>', '%')):
+                        logger.debug(f"[CMD_PROMPT] Detected prompt")
                         time.sleep(0.2)
                         if shell.recv_ready():
                             more = shell.recv(4096).decode('utf-8', errors='ignore')
@@ -809,8 +804,13 @@ class SSHSessionManager:
                             output += limited_more
                         break
                 else:
+                    # No data ready - check if we've been idle too long after receiving data
+                    if output and (time.time() - last_recv_time) > idle_timeout:
+                        logger.debug(f"[CMD_IDLE] No data for {idle_timeout}s, assuming complete")
+                        break
                     time.sleep(0.1)
             else:
+                logger.warning(f"[CMD_TIMEOUT] Timed out after {timeout}s")
                 return output, f"Command timed out after {timeout} seconds", 124
 
             # Clean output - remove command echo and prompt
@@ -821,6 +821,7 @@ class SSHSessionManager:
                     cleaned.append(line)
                 output = '\n'.join(cleaned).strip()
 
+            logger.debug(f"[CMD_SUCCESS] Output: {len(output)} bytes")
             return output, "", 0
 
         except Exception as e:
@@ -1095,29 +1096,42 @@ class SSHSessionManager:
             Tuple of (stdout, stderr, exit_code)
             If timeout reached, returns ("", "ASYNC:command_id", 124)
         """
+        logger = self.logger.getChild('execute_command')
+        logger.info(f"[EXEC_REQ] host={host}, cmd={command[:100]}..., timeout={timeout}")
+        
         # Validate command
         is_valid, error_msg = self._command_validator.validate_command(command)
         if not is_valid:
+            logger.warning(f"[EXEC_INVALID] {error_msg}")
             return "", error_msg, 1
 
         # Start async
+        logger.debug(f"[EXEC_ASYNC_START] Starting async execution")
         command_id = self.execute_command_async(
             host, username, command, password, key_filename, port,
             sudo_password, enable_password, enable_command, timeout
         )
+        logger.debug(f"[EXEC_ASYNC_ID] command_id={command_id}")
 
         # Poll until done or timeout
         start = time.time()
+        poll_count = 0
         while time.time() - start < timeout:
             status = self.get_command_status(command_id)
+            poll_count += 1
+            if poll_count % 10 == 0:
+                logger.debug(f"[EXEC_POLL] count={poll_count}, status={status.get('status')}")
+            
             if 'error' in status:
+                logger.error(f"[EXEC_ERROR] {status['error']}")
                 return "", status['error'], 1
             if status['status'] != 'running':
-                # Keep in history, don't delete
+                logger.info(f"[EXEC_DONE] status={status['status']}, polls={poll_count}")
                 return status['stdout'], status['stderr'], status['exit_code'] or 0
             time.sleep(0.1)
 
         # Timeout - return command ID
+        logger.warning(f"[EXEC_TIMEOUT] Returning async command_id after {timeout}s")
         return "", f"ASYNC:{command_id}", 124
 
 
@@ -1129,12 +1143,16 @@ class SSHSessionManager:
                                        enable_command: str = "enable"):
         """Execute command in background thread and update running command state."""
         logger = self.logger.getChild('async_worker')
+        logger.debug(f"[WORKER_START] command_id={command_id}")
         
         try:
             with self._lock:
                 if command_id not in self._commands:
+                    logger.error(f"[WORKER_NOTFOUND] command_id={command_id}")
                     return
                 running_cmd = self._commands[command_id]
+            
+            logger.debug(f"[WORKER_EXEC] Executing command")
             
             if sudo_password:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
@@ -1149,6 +1167,7 @@ class SSHSessionManager:
                     client, command, timeout, session_key
                 )
             
+            logger.debug(f"[WORKER_DONE] exit_code={exit_code}")
             with self._lock:
                 if command_id in self._commands:
                     running_cmd.stdout = stdout
@@ -1157,7 +1176,7 @@ class SSHSessionManager:
                     running_cmd.status = CommandStatus.COMPLETED
                     running_cmd.end_time = datetime.now()
         except Exception as e:
-            logger.error(f"Command {command_id} failed: {e}")
+            logger.error(f"[WORKER_ERROR] command_id={command_id}, error={e}")
             with self._lock:
                 if command_id in self._commands:
                     running_cmd = self._commands[command_id]
@@ -1182,7 +1201,7 @@ class SSHSessionManager:
         Returns a command ID that can be used to check status and retrieve output.
         """
         logger = self.logger.getChild('execute_async')
-        logger.info(f"Starting async command on {host}: {command}")
+        logger.info(f"[ASYNC_START] host={host}, cmd={command[:100]}...")
 
         _, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
             host, username, port
@@ -1210,12 +1229,14 @@ class SSHSessionManager:
         with self._lock:
             self._commands[command_id] = running_cmd
 
+        logger.debug(f"[ASYNC_SUBMIT] Submitting to thread pool")
         future = self._executor.submit(
             self._execute_command_async_worker,
             command_id, client, command, timeout, session_key,
             sudo_password, enable_password, enable_command
         )
         running_cmd.future = future
+        logger.debug(f"[ASYNC_SUBMITTED] command_id={command_id}")
 
         return command_id
 
