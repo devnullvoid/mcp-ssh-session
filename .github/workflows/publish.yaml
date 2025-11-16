@@ -1,10 +1,6 @@
 name: Publish package to PyPI
 
 on:
-  release:
-    types:
-      - published
-      - released
   workflow_dispatch:
 
 jobs:

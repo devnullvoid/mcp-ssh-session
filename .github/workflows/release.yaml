@@ -1,4 +1,4 @@
-name: Create Release
+name: Create Release and Publish
 
 on:
   push:
@@ -21,3 +21,33 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+  publish:
+    name: Build and publish
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mcp-ssh-session/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -217,11 +217,15 @@ class SSHSessionManager:
             key_filename: Path to SSH key file (optional, will use config if available)
             port: SSH port (optional, will use config if available, default 22)
         """
+        logger = self.logger.getChild('get_session')
+        logger.debug(f"Request for session to {host} for user {username}")
+
         # Get SSH config for this host
         host_config, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
             host, username, port
         )
         resolved_key = key_filename or host_config.get('identityfile', [None])[0]
+        logger.debug(f"Resolved session key: {session_key}")
 
         with self._lock:
             if session_key in self._sessions:
@@ -230,13 +234,18 @@ class SSHSessionManager:
                 try:
                     transport = client.get_transport()
                     if transport and transport.is_active():
+                        logger.debug(f"Reusing active session: {session_key}")
                         return client
-                except:
-                    pass
+                    else:
+                        logger.warning(f"Found dead session, will recreate: {session_key}")
+                except Exception as e:
+                    logger.warning(f"Error checking session, will recreate: {session_key} - {e}")
+
                 # Connection is dead, remove it
                 self._close_session(session_key)
 
             # Create new session
+            logger.info(f"Creating new session: {session_key}")
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -245,16 +254,27 @@ class SSHSessionManager:
                 'port': resolved_port,
                 'username': resolved_username,
             }
+            logger.debug(f"Connection parameters: {connect_kwargs}")
 
             if password:
                 connect_kwargs['password'] = password
+                logger.debug("Connecting with password")
             elif resolved_key:
                 # Expand ~ in key path
-                connect_kwargs['key_filename'] = os.path.expanduser(resolved_key)
+                expanded_key = os.path.expanduser(resolved_key)
+                connect_kwargs['key_filename'] = expanded_key
+                logger.debug(f"Connecting with key: {expanded_key}")
+            else:
+                logger.debug("Connecting without password or key (agent or no auth)")
 
-            client.connect(**connect_kwargs)
-            self._sessions[session_key] = client
-            return client
+            try:
+                client.connect(**connect_kwargs)
+                self._sessions[session_key] = client
+                logger.info(f"Successfully created new session: {session_key}")
+                return client
+            except Exception as e:
+                logger.error(f"Failed to connect to {session_key}: {e}", exc_info=True)
+                raise e
 
     def _enter_enable_mode(self, session_key: str, client: paramiko.SSHClient,
                           enable_password: str, enable_command: str = "enable",
@@ -369,74 +389,100 @@ class SSHSessionManager:
             username: SSH username (optional, will use config if available)
             port: SSH port (optional, will use config if available)
         """
+        logger = self.logger.getChild('close_session')
         _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        logger.info(f"Request to close session: {session_key}")
         with self._lock:
             self._close_session(session_key)
 
     def _close_session(self, session_key: str):
         """Internal method to close a session (not thread-safe)."""
+        logger = self.logger.getChild('internal_close')
+        logger.debug(f"Closing session resources for {session_key}")
+
         # Close persistent shell if exists
         if session_key in self._session_shells:
+            logger.debug(f"Closing persistent shell for {session_key}")
             try:
                 self._session_shells[session_key].close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing shell for {session_key}: {e}")
             del self._session_shells[session_key]
 
         if session_key in self._sessions:
+            logger.debug(f"Closing SSH client for {session_key}")
             try:
                 self._sessions[session_key].close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing client for {session_key}: {e}")
             del self._sessions[session_key]
+
         # Clean up enable mode tracking
         if session_key in self._enable_mode:
+            logger.debug(f"Cleaning up enable mode tracking for {session_key}")
             del self._enable_mode[session_key]
+        
+        logger.info(f"Session closed: {session_key}")
 
     def close_all_sessions(self):
         """Close all sessions and cleanup resources."""
+        logger = self.logger.getChild('close_all')
+        logger.info("Closing all active sessions and resources.")
         with self._lock:
             # Close all persistent shells
-            for shell in self._session_shells.values():
+            logger.debug(f"Closing {len(self._session_shells)} persistent shells.")
+            for key, shell in self._session_shells.items():
                 try:
                     shell.close()
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error closing shell for {key}: {e}")
             self._session_shells.clear()
 
             # Close all active channels
+            logger.debug(f"Closing {len(self._active_channels)} active channels.")
             for channel_id in list(self._active_channels.keys()):
                 try:
                     self._force_close_channel(channel_id)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error force-closing channel {channel_id}: {e}")
 
             # Close all SSH sessions
-            for client in self._sessions.values():
+            logger.debug(f"Closing {len(self._sessions)} SSH clients.")
+            for key, client in self._sessions.items():
                 try:
                     client.close()
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error closing client for {key}: {e}")
             self._sessions.clear()
             self._enable_mode.clear()
+        
+        logger.info("All sessions closed.")
 
         # Shutdown the executor
+        logger.info("Shutting down thread pool executor.")
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        except:
-            pass
+            logger.debug("Executor shutdown successfully.")
+        except Exception as e:
+            logger.error(f"Error shutting down executor: {e}", exc_info=True)
 
     def __del__(self):
         """Cleanup when the session manager is destroyed."""
+        logger = self.logger.getChild('destructor')
+        logger.info("SSHSessionManager instance being destroyed, ensuring cleanup.")
         try:
             self.close_all_sessions()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error during __del__ cleanup: {e}", exc_info=True)
 
     def list_sessions(self) -> list[str]:
         """List all active session keys."""
+        logger = self.logger.getChild('list_sessions')
         with self._lock:
-            return list(self._sessions.keys())
+            sessions = list(self._sessions.keys())
+            logger.info(f"Listing {len(sessions)} active sessions.")
+            logger.debug(f"Active sessions: {sessions}")
+            return sessions
 
     def _force_close_channel(self, channel_id: str):
         """Force close a hung channel."""
@@ -455,9 +501,11 @@ class SSHSessionManager:
 
     def _ensure_remote_dirs(self, sftp: paramiko.SFTPClient, remote_dir: str):
         """Ensure remote directory structure exists when writing files."""
+        logger = self.logger.getChild('ensure_dirs')
         if not remote_dir or remote_dir in (".", "/"):
             return
 
+        logger.debug(f"Ensuring remote directory exists: {remote_dir}")
         directories = []
         current = remote_dir
 
@@ -472,8 +520,10 @@ class SSHSessionManager:
             try:
                 attrs = sftp.stat(directory)
                 if not stat.S_ISDIR(attrs.st_mode):
+                    logger.error(f"Remote path exists and is not a directory: {directory}")
                     raise IOError(f"Remote path exists and is not a directory: {directory}")
             except FileNotFoundError:
+                logger.info(f"Creating remote directory: {directory}")
                 sftp.mkdir(directory)
 
     def _execute_with_thread_timeout(self, func, timeout: int, *args, **kwargs) -> Tuple[str, str, int]:
@@ -505,10 +555,12 @@ class SSHSessionManager:
         try:
             # Enforce timeout limits
             timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
+            logger.debug(f"Executing sudo command with timeout {timeout}s: {command[:100]}...")
 
             # Ensure command starts with sudo
             if not command.strip().startswith('sudo'):
                 command = f"sudo {command}"
+                logger.debug(f"Prepended sudo to command.")
 
             shell = client.invoke_shell()
             shell.settimeout(timeout)
@@ -516,9 +568,11 @@ class SSHSessionManager:
 
             # Clear any initial output
             if shell.recv_ready():
-                shell.recv(4096).decode('utf-8', errors='ignore')
+                initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
+                logger.debug(f"Cleared initial shell output: {initial_output!r}")
 
             # Send command
+            logger.debug("Sending command to shell.")
             shell.send(command + '\n')
             time.sleep(0.5)
 
@@ -531,6 +585,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    logger.debug(f"Received chunk of size {len(chunk)}")
 
                     # Apply output limiting
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -542,6 +597,7 @@ class SSHSessionManager:
 
                     # Look for sudo password prompt
                     if not password_sent and re.search(r'\[sudo\].*password|password.*:', output, re.IGNORECASE):
+                        logger.info("Sudo password prompt detected. Sending password.")
                         shell.send(sudo_password + '\n')
                         password_sent = True
                         time.sleep(0.3)
@@ -550,6 +606,7 @@ class SSHSessionManager:
                     # Check if command completed (got prompt back)
                     lines = output.split('\n')
                     if len(lines) > 1 and lines[-1].strip().endswith(('$', '#', '>')):
+                        logger.debug("Command prompt detected, assuming command finished.")
                         # Wait a bit more to ensure all output is received
                         time.sleep(0.3)
                         if shell.recv_ready():
@@ -574,9 +631,11 @@ class SSHSessionManager:
                     cleaned_lines.append(line)
 
             output = '\n'.join(cleaned_lines).strip()
+            logger.debug(f"Sudo command finished. Output size: {len(output)}")
 
             # Check for sudo errors
             if 'Sorry, try again' in output or 'incorrect password' in output.lower():
+                logger.error("Sudo incorrect password.")
                 return "", "sudo: incorrect password", 1
 
             return output, "", 0
@@ -597,6 +656,8 @@ class SSHSessionManager:
     def _execute_sudo_command(self, client: paramiko.SSHClient, command: str,
                              sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
         """Execute a command with sudo, with thread-based timeout protection."""
+        logger = self.logger.getChild('sudo_wrapper')
+        logger.debug(f"Executing sudo command via deprecated thread timeout wrapper: {command[:100]}...")
         return self._execute_with_thread_timeout(
             self._execute_sudo_command_internal,
             timeout,
@@ -608,17 +669,22 @@ class SSHSessionManager:
                                               enable_command: str, timeout: int) -> tuple[str, str, int]:
         """Internal method to execute command in enable mode on network device."""
         logger = self.logger.getChild('enable_mode_command')
+        logger.debug(f"Executing in enable mode on {session_key}: {command[:100]}...")
 
         # Check if we need to enter enable mode
         shell = None
         if not self._enable_mode.get(session_key, False):
+            logger.info(f"Not in enable mode, attempting to enter for {session_key}")
             success, result = self._enter_enable_mode(session_key, client, enable_password, enable_command)
             if not success:
+                logger.error(f"Failed to enter enable mode for {session_key}: {result}")
                 return "", f"Failed to enter enable mode: {result}", 1
             # We got the shell from _enter_enable_mode
             shell, output = result
+            logger.info(f"Successfully entered enable mode for {session_key}")
         else:
             # We're already in enable mode, get a new shell
+            logger.debug(f"Already in enable mode for {session_key}, getting new shell.")
             shell = client.invoke_shell()
             time.sleep(0.5)
             # Read and discard initial output
@@ -657,6 +723,7 @@ class SSHSessionManager:
 
                         # Check for prompt (ends with # or >)
                         if output.strip() and (output.strip().endswith('#') or output.strip().endswith('>')):
+                            logger.debug("Enable mode prompt detected, assuming command finished.")
                             # Wait a bit more to ensure all output is received
                             time.sleep(0.5)
                             if shell.recv_ready():
@@ -682,9 +749,11 @@ class SSHSessionManager:
                         if not (line.endswith(('#', '>')) or not line):  # Skip prompt and empty lines
                             cleaned_lines.append(line)
                     output = '\n'.join(cleaned_lines).strip()
-
+                
+                logger.debug(f"Enable mode command finished. Output size: {len(output)}")
                 return output, "", 0
             else:
+                logger.error("Internal logic error: should be in enable mode but flag is false.")
                 return "", "Not in enable mode", 1
 
         except Exception as e:
@@ -706,30 +775,31 @@ class SSHSessionManager:
             shell = self._session_shells[session_key]
             try:
                 if shell.closed or not shell.get_transport() or not shell.get_transport().is_active():
-                    logger.debug(f"[SHELL_DEAD] {session_key}")
+                    logger.warning(f"[SHELL_DEAD] Shell for {session_key} is dead. Recreating.")
                     del self._session_shells[session_key]
                 else:
-                    logger.debug(f"[SHELL_REUSE] {session_key}")
+                    logger.debug(f"[SHELL_REUSE] Reusing existing shell for {session_key}")
                     return shell
-            except:
-                logger.debug(f"[SHELL_ERROR] {session_key}")
+            except Exception as e:
+                logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {e}. Recreating.")
                 if session_key in self._session_shells:
                     del self._session_shells[session_key]
 
-        logger.debug(f"[SHELL_CREATE] {session_key}")
+        logger.info(f"[SHELL_CREATE] Creating new persistent shell for {session_key}")
         shell = client.invoke_shell()
         time.sleep(0.5)
         if shell.recv_ready():
-            shell.recv(4096)
+            initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
+            logger.debug(f"[SHELL_CREATE] Initial shell output: {initial_output!r}")
         self._session_shells[session_key] = shell
-        logger.debug(f"[SHELL_READY] {session_key}")
+        logger.info(f"[SHELL_READY] New shell for {session_key} is ready.")
         return shell
 
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
                                            timeout: int, session_key: str) -> tuple[str, str, int]:
         """Internal method to execute a standard SSH command using persistent shell."""
         logger = self.logger.getChild('standard_command')
-        logger.debug(f"[CMD_START] {command[:100]}...")
+        logger.debug(f"[CMD_START] Executing on {session_key}: {command[:100]}...")
         shell = None
         try:
             shell = self._get_or_create_shell(session_key, client)
@@ -738,10 +808,10 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
-            logger.debug(f"[CMD_SEND] Sending command")
+            logger.debug(f"[CMD_SEND] Sending command to shell.")
             shell.send(command + '\n')
             time.sleep(0.3)
-            logger.debug(f"[CMD_READ] Reading output")
+            logger.debug(f"[CMD_READ] Reading output from shell.")
 
             # Read output with size limiting
             output_limiter = OutputLimiter()
@@ -766,7 +836,7 @@ class SSHSessionManager:
                     # Check for prompt (command completed)
                     lines = output.split('\n')
                     if len(lines) > 1 and lines[-1].strip().endswith(('$', '#', '>', '%')):
-                        logger.debug(f"[CMD_PROMPT] Detected prompt")
+                        logger.debug(f"[CMD_PROMPT] Detected prompt, assuming command finished.")
                         time.sleep(0.2)
                         if shell.recv_ready():
                             more = shell.recv(4096).decode('utf-8', errors='ignore')
@@ -791,7 +861,7 @@ class SSHSessionManager:
                     cleaned.append(line)
                 output = '\n'.join(cleaned).strip()
 
-            logger.debug(f"[CMD_SUCCESS] Output: {len(output)} bytes")
+            logger.debug(f"[CMD_SUCCESS] Command finished. Output size: {len(output)} bytes")
             return output, "", 0
 
         except Exception as e:
@@ -825,6 +895,7 @@ class SSHSessionManager:
         logger.info(f"Reading remote file on {host}: {remote_path}")
 
         if not remote_path:
+            logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
 
         _, _, _, _, session_key = self._resolve_connection(host, username, port)
@@ -833,6 +904,7 @@ class SSHSessionManager:
         byte_limit = self.MAX_FILE_TRANSFER_SIZE
         if max_bytes is not None:
             byte_limit = min(max_bytes, self.MAX_FILE_TRANSFER_SIZE)
+        logger.debug(f"Byte limit set to {byte_limit}")
 
         used_encoding = encoding or "utf-8"
         used_errors = errors or "replace"
@@ -841,17 +913,21 @@ class SSHSessionManager:
         sftp = None
         permission_denied = False
         try:
+            logger.debug("Attempting to read file via SFTP.")
             sftp = client.open_sftp()
             attrs = sftp.stat(remote_path)
             if stat.S_ISDIR(attrs.st_mode):
+                logger.error(f"Remote path is a directory: {remote_path}")
                 return "", f"Remote path is a directory: {remote_path}", 1
 
             with sftp.file(remote_path, "rb") as remote_file:
                 data = remote_file.read(byte_limit + 1)
+            logger.debug(f"Read {len(data)} bytes via SFTP.")
 
             truncated = len(data) > byte_limit
             if truncated:
                 data = data[:byte_limit]
+                logger.warning(f"File content truncated to {byte_limit} bytes.")
 
             try:
                 content = data.decode(used_encoding, used_errors)
@@ -866,13 +942,17 @@ class SSHSessionManager:
                 )
                 content += f"\n\n[CONTENT TRUNCATED after {byte_limit} bytes]"
 
+            logger.info(f"Successfully read file {remote_path} via SFTP.")
             return content, stderr_msg, 0
         except FileNotFoundError:
+            logger.error(f"Remote file not found: {remote_path}")
             return "", f"Remote file not found: {remote_path}", 1
         except PermissionError:
+            logger.warning(f"SFTP permission denied for {remote_path}.")
             permission_denied = True
         except Exception as e:
             if 'permission denied' in str(e).lower():
+                logger.warning(f"SFTP permission denied for {remote_path}.")
                 permission_denied = True
             else:
                 logger.error(f"Error reading file {remote_path} on {session_key}: {str(e)}", exc_info=True)
@@ -889,6 +969,7 @@ class SSHSessionManager:
             logger.info(f"SFTP permission denied, falling back to sudo cat for {remote_path}")
             # Use head to limit output size
             cmd = f"sudo cat {shlex.quote(remote_path)} | head -c {byte_limit}"
+            logger.debug(f"Sudo fallback command: {cmd}")
 
             if sudo_password:
                 stdout, stderr, exit_code = self._execute_sudo_command(client, cmd, sudo_password, timeout=30)
@@ -897,6 +978,7 @@ class SSHSessionManager:
                 stdout, stderr, exit_code = self._execute_standard_command_internal(client, cmd, 30, session_key)
 
             if exit_code != 0:
+                logger.error(f"Sudo fallback failed for {remote_path}: {stderr}")
                 return "", f"Permission denied and sudo failed: {stderr}", exit_code
 
             # Check if output was truncated
@@ -906,11 +988,14 @@ class SSHSessionManager:
                 stderr_msg = f"Content truncated to {byte_limit} bytes. Increase max_bytes to retrieve full file."
             else:
                 stderr_msg = ""
-
+            
+            logger.info(f"Successfully read file {remote_path} via sudo fallback.")
             return stdout, stderr_msg, 0
         elif permission_denied:
+            logger.error(f"Permission denied reading {remote_path} and no sudo fallback specified.")
             return "", "Permission denied reading file. Set use_sudo=True or provide sudo_password to retry with sudo.", 1
 
+        logger.error("Unexpected error in read_file logic.")
         return "", "Unexpected error in read_file", 1
 
     def write_file(self, host: str, remote_path: str, content: str,
@@ -931,6 +1016,7 @@ class SSHSessionManager:
         logger.info(f"Writing remote file on {host}: {remote_path} (append={append})")
 
         if not remote_path:
+            logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
 
         used_encoding = encoding or "utf-8"
@@ -939,13 +1025,16 @@ class SSHSessionManager:
         try:
             data = content.encode(used_encoding, used_errors)
         except Exception as e:
+            logger.error(f"Failed to encode content using encoding '{used_encoding}': {e}")
             return "", f"Failed to encode content using encoding '{used_encoding}': {str(e)}", 1
 
         byte_limit = self.MAX_FILE_TRANSFER_SIZE
         if max_bytes is not None:
             byte_limit = min(max_bytes, self.MAX_FILE_TRANSFER_SIZE)
+        logger.debug(f"Byte limit set to {byte_limit}")
 
         if len(data) > byte_limit:
+            logger.error(f"Content size {len(data)} exceeds limit {byte_limit}.")
             return "", (
                 f"Content size {len(data)} bytes exceeds maximum allowed {byte_limit} bytes. "
                 "Split the write into smaller chunks."
@@ -958,6 +1047,7 @@ class SSHSessionManager:
         if not use_sudo and not sudo_password:
             sftp = None
             try:
+                logger.debug("Attempting to write file via SFTP.")
                 sftp = client.open_sftp()
 
                 if make_dirs:
@@ -965,23 +1055,29 @@ class SSHSessionManager:
                     self._ensure_remote_dirs(sftp, directory)
 
                 mode = "ab" if append else "wb"
+                logger.debug(f"Opening remote file in mode '{mode}'.")
                 with sftp.file(remote_path, mode) as remote_file:
                     remote_file.write(data)
                     remote_file.flush()
 
                 if permissions is not None:
+                    logger.debug(f"Setting permissions to {oct(permissions)}.")
                     sftp.chmod(remote_path, permissions)
 
                 message = f"Wrote {len(data)} bytes to {remote_path}"
                 if append:
                     message += " (append)"
+                logger.info(f"Successfully wrote file via SFTP: {message}")
                 return message, "", 0
             except FileNotFoundError:
+                logger.error(f"Remote path not found: {remote_path}")
                 return "", f"Remote path not found: {remote_path}", 1
             except PermissionError:
+                logger.warning(f"SFTP permission denied for {remote_path}. Will try sudo if configured.")
                 return "", "Permission denied writing file. Set use_sudo=True or provide sudo_password to retry with sudo.", 1
             except Exception as e:
                 if 'permission denied' in str(e).lower():
+                    logger.warning(f"SFTP permission denied for {remote_path}. Will try sudo if configured.")
                     return "", "Permission denied writing file. Set use_sudo=True or provide sudo_password to retry with sudo.", 1
                 logger.error(f"Error writing file {remote_path} on {session_key}: {str(e)}", exc_info=True)
                 return "", f"Error writing remote file: {str(e)}", 1
@@ -1007,8 +1103,10 @@ class SSHSessionManager:
             directory = posixpath.dirname(remote_path)
             if directory and directory != '/':
                 mkdir_cmd = f"sudo mkdir -p {shlex.quote(directory)}"
+                logger.debug(f"Executing mkdir command: {mkdir_cmd}")
                 _, stderr, exit_code = exec_sudo(mkdir_cmd)
                 if exit_code != 0:
+                    logger.error(f"Failed to create directories with sudo: {stderr}")
                     return "", f"Failed to create directories: {stderr}", exit_code
 
         # Write content using tee (supports both write and append)
@@ -1018,15 +1116,18 @@ class SSHSessionManager:
             cmd = f'echo -n "{escaped_content}" | sudo tee -a {shlex.quote(remote_path)} > /dev/null'
         else:
             cmd = f'echo -n "{escaped_content}" | sudo tee {shlex.quote(remote_path)} > /dev/null'
+        logger.debug(f"Executing write command: {cmd[:100]}...")
 
         stdout, stderr, exit_code = exec_sudo(cmd)
 
         if exit_code != 0:
+            logger.error(f"Failed to write file with sudo: {stderr}")
             return "", f"Failed to write file with sudo: {stderr}", exit_code
 
         # Set permissions if specified
         if permissions is not None:
             chmod_cmd = f"sudo chmod {oct(permissions)[2:]} {shlex.quote(remote_path)}"
+            logger.debug(f"Executing chmod command: {chmod_cmd}")
             _, stderr, exit_code = exec_sudo(chmod_cmd)
             if exit_code != 0:
                 logger.warning(f"Failed to set permissions: {stderr}")
@@ -1036,6 +1137,7 @@ class SSHSessionManager:
             message += " (append)"
         if not sudo_password:
             message += " (passwordless)"
+        logger.info(f"Successfully wrote file via sudo: {message}")
         return message, "", 0
 
     def execute_command(self, host: str, username: Optional[str] = None,
@@ -1096,7 +1198,7 @@ class SSHSessionManager:
                 logger.error(f"[EXEC_ERROR] {status['error']}")
                 return "", status['error'], 1
             if status['status'] != 'running':
-                logger.info(f"[EXEC_DONE] status={status['status']}, polls={poll_count}")
+                logger.info(f"[EXEC_DONE] status={status['status']}, polls={poll_count}, duration={time.time() - start:.2f}s")
                 return status['stdout'], status['stderr'], status['exit_code'] or 0
             time.sleep(0.1)
 
@@ -1118,26 +1220,29 @@ class SSHSessionManager:
         try:
             with self._lock:
                 if command_id not in self._commands:
-                    logger.error(f"[WORKER_NOTFOUND] command_id={command_id}")
+                    logger.error(f"[WORKER_NOTFOUND] command_id={command_id} no longer in registry.")
                     return
                 running_cmd = self._commands[command_id]
 
-            logger.debug(f"[WORKER_EXEC] Executing command")
+            logger.debug(f"[WORKER_EXEC] Executing command for {command_id}")
 
             if sudo_password:
+                logger.debug(f"Executing as sudo for {command_id}")
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
                 )
             elif enable_password:
+                logger.debug(f"Executing in enable mode for {command_id}")
                 stdout, stderr, exit_code = self._execute_enable_mode_command_internal(
                     client, session_key, command, enable_password, enable_command, timeout
                 )
             else:
+                logger.debug(f"Executing as standard command for {command_id}")
                 stdout, stderr, exit_code = self._execute_standard_command_internal(
                     client, command, timeout, session_key
                 )
 
-            logger.debug(f"[WORKER_DONE] exit_code={exit_code}")
+            logger.debug(f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}")
             with self._lock:
                 if command_id in self._commands:
                     running_cmd.stdout = stdout
@@ -1145,8 +1250,9 @@ class SSHSessionManager:
                     running_cmd.exit_code = exit_code
                     running_cmd.status = CommandStatus.COMPLETED
                     running_cmd.end_time = datetime.now()
+                    logger.info(f"Command {command_id} completed.")
         except Exception as e:
-            logger.error(f"[WORKER_ERROR] command_id={command_id}, error={e}")
+            logger.error(f"[WORKER_ERROR] command_id={command_id}, error={e}", exc_info=True)
             with self._lock:
                 if command_id in self._commands:
                     running_cmd = self._commands[command_id]
@@ -1177,10 +1283,23 @@ class SSHSessionManager:
             host, username, port
         )
 
+        # Check if a command is already running for this session
+        with self._lock:
+            for cmd in self._commands.values():
+                if cmd.session_key == session_key and cmd.status == CommandStatus.RUNNING:
+                    error_msg = (
+                        f"A command is already running in this session ({session_key}).\n"
+                        f"Running Command ID: {cmd.command_id}\n"
+                        f"Running Command Status: {cmd.status.value}"
+                    )
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+
         client = self.get_or_create_session(host, username, password, key_filename, port)
         shell = self._get_or_create_shell(session_key, client)
 
         command_id = str(uuid.uuid4())
+        logger.debug(f"Generated command_id: {command_id}")
 
         running_cmd = RunningCommand(
             command_id=command_id,
@@ -1198,26 +1317,30 @@ class SSHSessionManager:
 
         with self._lock:
             self._commands[command_id] = running_cmd
+            logger.debug(f"Registered running command {command_id}")
 
-        logger.debug(f"[ASYNC_SUBMIT] Submitting to thread pool")
+        logger.debug(f"[ASYNC_SUBMIT] Submitting command {command_id} to thread pool")
         future = self._executor.submit(
             self._execute_command_async_worker,
             command_id, client, command, timeout, session_key,
             sudo_password, enable_password, enable_command
         )
         running_cmd.future = future
-        logger.debug(f"[ASYNC_SUBMITTED] command_id={command_id}")
+        logger.info(f"[ASYNC_SUBMITTED] command_id={command_id}")
 
         return command_id
 
     def get_command_status(self, command_id: str) -> dict:
         """Get the status and output of an async command."""
+        logger = self.logger.getChild('get_status')
+        logger.debug(f"Fetching status for command_id: {command_id}")
         with self._lock:
             if command_id not in self._commands:
+                logger.error(f"Command ID not found: {command_id}")
                 return {"error": "Command ID not found"}
 
             cmd = self._commands[command_id]
-            return {
+            status_payload = {
                 "command_id": cmd.command_id,
                 "session_key": cmd.session_key,
                 "command": cmd.command,
@@ -1228,23 +1351,32 @@ class SSHSessionManager:
                 "start_time": cmd.start_time.isoformat(),
                 "end_time": cmd.end_time.isoformat() if cmd.end_time else None
             }
+            logger.debug(f"Status for {command_id}: {status_payload['status']}")
+            return status_payload
 
     def interrupt_command_by_id(self, command_id: str) -> tuple[bool, str]:
         """Interrupt a running async command by its ID."""
+        logger = self.logger.getChild('interrupt')
+        logger.info(f"Attempting to interrupt command_id: {command_id}")
         with self._lock:
             if command_id not in self._commands:
+                logger.error(f"Command ID not found for interrupt: {command_id}")
                 return False, f"Command ID {command_id} not found"
 
             cmd = self._commands[command_id]
             if cmd.status != CommandStatus.RUNNING:
+                logger.warning(f"Command {command_id} is not running (status: {cmd.status.value})")
                 return False, f"Command {command_id} is not running (status: {cmd.status.value})"
 
             try:
+                logger.debug(f"Sending Ctrl+C to shell for command {command_id}")
                 cmd.shell.send('\x03')  # Send Ctrl+C
                 cmd.status = CommandStatus.INTERRUPTED
                 cmd.end_time = datetime.now()
+                logger.info(f"Successfully sent interrupt signal to command {command_id}")
                 return True, f"Sent interrupt signal to command {command_id}"
             except Exception as e:
+                logger.error(f"Failed to interrupt command {command_id}: {e}", exc_info=True)
                 return False, f"Failed to interrupt command {command_id}: {e}"
 
     def send_input(self, command_id: str, input_text: str) -> tuple[bool, str, str]:
@@ -1257,15 +1389,20 @@ class SSHSessionManager:
         Returns:
             Tuple of (success: bool, output: str, error: str)
         """
+        logger = self.logger.getChild('send_input')
+        logger.info(f"Sending input to command_id: {command_id}")
         with self._lock:
             if command_id not in self._commands:
+                logger.error(f"Command ID not found: {command_id}")
                 return False, "", "Command ID not found"
 
             cmd = self._commands[command_id]
             if cmd.status != CommandStatus.RUNNING:
+                logger.warning(f"Command is not running (status: {cmd.status.value})")
                 return False, "", f"Command is not running (status: {cmd.status.value})"
 
             try:
+                logger.debug(f"Sending text to shell: {input_text!r}")
                 cmd.shell.send(input_text)
                 time.sleep(0.2)
 
@@ -1274,9 +1411,11 @@ class SSHSessionManager:
                 if cmd.shell.recv_ready():
                     output = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                     cmd.stdout += output
+                    logger.debug(f"Received {len(output)} bytes of new output.")
 
                 return True, output, ""
             except Exception as e:
+                logger.error(f"Failed to send input: {e}", exc_info=True)
                 return False, "", f"Failed to send input: {e}"
 
     def send_input_by_session(self, host: str, input_text: str, username: Optional[str] = None,
@@ -1292,29 +1431,36 @@ class SSHSessionManager:
         Returns:
             Tuple of (success: bool, output: str, error: str)
         """
+        logger = self.logger.getChild('send_input_session')
         _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        logger.info(f"Sending input to session: {session_key}")
 
         with self._lock:
             if session_key not in self._session_shells:
+                logger.error(f"No active shell for session: {session_key}")
                 return False, "", "No active shell for this session"
 
             shell = self._session_shells[session_key]
             try:
+                logger.debug(f"Sending text to shell: {input_text!r}")
                 shell.send(input_text)
                 time.sleep(0.2)
 
                 output = ""
                 if shell.recv_ready():
                     output = shell.recv(65535).decode('utf-8', errors='replace')
+                    logger.debug(f"Received {len(output)} bytes of new output.")
 
                 return True, output, ""
             except Exception as e:
+                logger.error(f"Failed to send input to session {session_key}: {e}", exc_info=True)
                 return False, "", f"Failed to send input: {e}"
 
     def list_running_commands(self) -> list[dict]:
         """List all running async commands."""
+        logger = self.logger.getChild('list_running')
         with self._lock:
-            return [
+            running_list = [
                 {
                     "command_id": cmd.command_id,
                     "session_key": cmd.session_key,
@@ -1325,9 +1471,12 @@ class SSHSessionManager:
                 for cmd in self._commands.values()
                 if cmd.status == CommandStatus.RUNNING
             ]
+            logger.info(f"Found {len(running_list)} running commands.")
+            return running_list
 
     def list_command_history(self, limit: int = 50) -> list[dict]:
         """List recent command history (completed, failed, interrupted)."""
+        logger = self.logger.getChild('list_history')
         with self._lock:
             completed = [
                 {
@@ -1344,18 +1493,25 @@ class SSHSessionManager:
             ]
             # Sort by end time, most recent first
             completed.sort(key=lambda x: x['end_time'] or '', reverse=True)
-            return completed[:limit]
+            result = completed[:limit]
+            logger.info(f"Returning {len(result)} commands from history (limit: {limit}).")
+            return result
 
     def _cleanup_old_commands(self):
         """Remove old completed commands, keeping only recent ones."""
+        logger = self.logger.getChild('cleanup')
         with self._lock:
             completed = [
                 (cmd_id, cmd) for cmd_id, cmd in self._commands.items()
                 if cmd.status in [CommandStatus.COMPLETED, CommandStatus.FAILED, CommandStatus.INTERRUPTED]
             ]
             if len(completed) > self._max_completed_commands:
+                logger.info(f"Found {len(completed)} completed commands, exceeding limit of {self._max_completed_commands}. Cleaning up.")
                 # Sort by end time, remove oldest
                 completed.sort(key=lambda x: x[1].end_time or datetime.min)
                 to_remove = completed[:-self._max_completed_commands]
+                logger.debug(f"Removing {len(to_remove)} old commands.")
                 for cmd_id, _ in to_remove:
                     del self._commands[cmd_id]
+            else:
+                logger.debug(f"Cleanup check: {len(completed)} completed commands within limit of {self._max_completed_commands}.")
