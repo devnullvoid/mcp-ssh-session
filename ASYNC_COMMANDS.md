@@ -93,7 +93,15 @@ Check async command status and output.
 Send Ctrl+C to running command.
 
 ### list_running_commands
-List all active async commands.
+List all currently running async commands (status: running).
+
+### list_command_history
+List recent command history (completed, failed, interrupted).
+
+```python
+history = list_command_history(limit=50)
+# Shows last 50 completed commands, most recent first
+```
 
 ## Best Practices
 

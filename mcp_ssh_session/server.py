@@ -242,13 +242,6 @@ def write_file(
 
 
 @mcp.tool()
-def interrupt_command(host: str, username: Optional[str] = None, port: Optional[int] = None) -> str:
-    """Interrupt a running command on a session by sending Ctrl+C."""
-    success, message = session_manager.interrupt_command(host, username, port)
-    return message
-
-
-@mcp.tool()
 def execute_command_async(
     host: str,
     command: str,
@@ -339,5 +332,91 @@ def list_running_commands() -> str:
         result += f"  Command: {cmd['command']}\n"
         result += f"  Status: {cmd['status']}\n"
         result += f"  Started: {cmd['start_time']}\n"
+    
+    return result
+
+
+@mcp.tool()
+def list_command_history(limit: int = 50) -> str:
+    """List recent command history (completed, failed, interrupted commands).
+    
+    Args:
+        limit: Maximum number of commands to return (default: 50)
+    """
+    commands = session_manager.list_command_history(limit)
+    if not commands:
+        return "No command history"
+    
+    result = f"Command History (last {len(commands)}):\n"
+    for cmd in commands:
+        result += f"\n- ID: {cmd['command_id']}\n"
+        result += f"  Session: {cmd['session_key']}\n"
+        result += f"  Command: {cmd['command']}\n"
+        result += f"  Status: {cmd['status']}\n"
+        if cmd['exit_code'] is not None:
+            result += f"  Exit Code: {cmd['exit_code']}\n"
+        result += f"  Started: {cmd['start_time']}\n"
+        if cmd['end_time']:
+            result += f"  Ended: {cmd['end_time']}\n"
+    
+    return result
+
+
+@mcp.tool()
+def send_input(command_id: str, input_text: str) -> str:
+    """Send input to a running async command and return any new output.
+    
+    Useful for interacting with commands that require user input, such as:
+    - Pagers (less, more): send 'q' to quit, space to page down
+    - Yes/no prompts: send 'y' or 'n'
+    - Interactive programs: send appropriate responses
+    
+    Args:
+        command_id: The command ID to send input to
+        input_text: Text to send (e.g., 'q', 'y\n', etc.)
+    """
+    success, output, error = session_manager.send_input(command_id, input_text)
+    
+    if not success:
+        return f"Error: {error}"
+    
+    result = f"Input sent successfully\n"
+    if output:
+        result += f"\nOutput:\n{output}"
+    else:
+        result += "\nNo immediate output received"
+    
+    return result
+
+
+@mcp.tool()
+def send_input_by_session(
+    host: str,
+    input_text: str,
+    username: Optional[str] = None,
+    port: Optional[int] = None
+) -> str:
+    """Send input to the active shell for a session.
+    
+    Useful for clearing stuck interactive states or sending input to the current shell.
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        input_text: Text to send (e.g., 'q\n' to quit pager, '\x03' for Ctrl+C)
+        username: SSH username (optional)
+        port: SSH port (optional)
+    """
+    success, output, error = session_manager.send_input_by_session(
+        host, input_text, username, port
+    )
+    
+    if not success:
+        return f"Error: {error}"
+    
+    result = f"Input sent successfully\n"
+    if output:
+        result += f"\nOutput:\n{output}"
+    else:
+        result += "\nNo immediate output received"
     
     return result

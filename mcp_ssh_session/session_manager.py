@@ -188,7 +188,7 @@ class SSHSessionManager:
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
         self._active_commands: Dict[str, Any] = {} # Track active command shells
-        self._running_commands: Dict[str, RunningCommand] = {}  # Track async commands by ID
+        self._commands: Dict[str, RunningCommand] = {}  # Command history (running + completed)
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
         self._command_validator = CommandValidator()
@@ -1110,30 +1110,17 @@ class SSHSessionManager:
         start = time.time()
         while time.time() - start < timeout:
             status = self.get_command_status(command_id)
+            if 'error' in status:
+                return "", status['error'], 1
             if status['status'] != 'running':
-                # Cleanup and return
-                with self._lock:
-                    if command_id in self._running_commands:
-                        del self._running_commands[command_id]
+                # Keep in history, don't delete
                 return status['stdout'], status['stderr'], status['exit_code'] or 0
             time.sleep(0.1)
 
         # Timeout - return command ID
         return "", f"ASYNC:{command_id}", 124
 
-    def interrupt_command(self, host: str, username: Optional[str] = None, port: Optional[int] = None) -> tuple[bool, str]:
-        """Interrupt a running command on a session by sending Ctrl+C."""
-        _, _, _, _, session_key = self._resolve_connection(host, username, port)
-        with self._lock:
-            if session_key in self._active_commands:
-                shell = self._active_commands[session_key]
-                try:
-                    shell.send('\x03')  # Send Ctrl+C
-                    return True, f"Sent interrupt signal (Ctrl+C) to session {session_key}"
-                except Exception as e:
-                    return False, f"Failed to send interrupt signal to session {session_key}: {e}"
-            else:
-                return False, f"No active command found for session {session_key}"
+
 
     def _execute_command_async_worker(self, command_id: str, client: paramiko.SSHClient,
                                        command: str, timeout: int, session_key: str,
@@ -1142,9 +1129,13 @@ class SSHSessionManager:
                                        enable_command: str = "enable"):
         """Execute command in background thread and update running command state."""
         logger = self.logger.getChild('async_worker')
-        running_cmd = self._running_commands[command_id]
         
         try:
+            with self._lock:
+                if command_id not in self._commands:
+                    return
+                running_cmd = self._commands[command_id]
+            
             if sudo_password:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
@@ -1159,18 +1150,21 @@ class SSHSessionManager:
                 )
             
             with self._lock:
-                running_cmd.stdout = stdout
-                running_cmd.stderr = stderr
-                running_cmd.exit_code = exit_code
-                running_cmd.status = CommandStatus.COMPLETED
-                running_cmd.end_time = datetime.now()
+                if command_id in self._commands:
+                    running_cmd.stdout = stdout
+                    running_cmd.stderr = stderr
+                    running_cmd.exit_code = exit_code
+                    running_cmd.status = CommandStatus.COMPLETED
+                    running_cmd.end_time = datetime.now()
         except Exception as e:
             logger.error(f"Command {command_id} failed: {e}")
             with self._lock:
-                running_cmd.stderr = str(e)
-                running_cmd.exit_code = 1
-                running_cmd.status = CommandStatus.FAILED
-                running_cmd.end_time = datetime.now()
+                if command_id in self._commands:
+                    running_cmd = self._commands[command_id]
+                    running_cmd.stderr = str(e)
+                    running_cmd.exit_code = 1
+                    running_cmd.status = CommandStatus.FAILED
+                    running_cmd.end_time = datetime.now()
         finally:
             # Cleanup old commands
             self._cleanup_old_commands()
@@ -1214,7 +1208,7 @@ class SSHSessionManager:
         )
 
         with self._lock:
-            self._running_commands[command_id] = running_cmd
+            self._commands[command_id] = running_cmd
 
         future = self._executor.submit(
             self._execute_command_async_worker,
@@ -1228,10 +1222,10 @@ class SSHSessionManager:
     def get_command_status(self, command_id: str) -> dict:
         """Get the status and output of an async command."""
         with self._lock:
-            if command_id not in self._running_commands:
+            if command_id not in self._commands:
                 return {"error": "Command ID not found"}
             
-            cmd = self._running_commands[command_id]
+            cmd = self._commands[command_id]
             return {
                 "command_id": cmd.command_id,
                 "session_key": cmd.session_key,
@@ -1247,10 +1241,10 @@ class SSHSessionManager:
     def interrupt_command_by_id(self, command_id: str) -> tuple[bool, str]:
         """Interrupt a running async command by its ID."""
         with self._lock:
-            if command_id not in self._running_commands:
+            if command_id not in self._commands:
                 return False, f"Command ID {command_id} not found"
             
-            cmd = self._running_commands[command_id]
+            cmd = self._commands[command_id]
             if cmd.status != CommandStatus.RUNNING:
                 return False, f"Command {command_id} is not running (status: {cmd.status.value})"
             
@@ -1261,6 +1255,70 @@ class SSHSessionManager:
                 return True, f"Sent interrupt signal to command {command_id}"
             except Exception as e:
                 return False, f"Failed to interrupt command {command_id}: {e}"
+
+    def send_input(self, command_id: str, input_text: str) -> tuple[bool, str, str]:
+        """Send input to a running command and return any new output.
+        
+        Args:
+            command_id: The command ID to send input to
+            input_text: Text to send (e.g., 'q' to quit pager, 'y' for yes/no prompts)
+            
+        Returns:
+            Tuple of (success: bool, output: str, error: str)
+        """
+        with self._lock:
+            if command_id not in self._commands:
+                return False, "", "Command ID not found"
+            
+            cmd = self._commands[command_id]
+            if cmd.status != CommandStatus.RUNNING:
+                return False, "", f"Command is not running (status: {cmd.status.value})"
+            
+            try:
+                cmd.shell.send(input_text)
+                time.sleep(0.2)
+                
+                # Read any new output
+                output = ""
+                if cmd.shell.recv_ready():
+                    output = cmd.shell.recv(65535).decode('utf-8', errors='replace')
+                    cmd.stdout += output
+                
+                return True, output, ""
+            except Exception as e:
+                return False, "", f"Failed to send input: {e}"
+
+    def send_input_by_session(self, host: str, input_text: str, username: Optional[str] = None,
+                                port: Optional[int] = None) -> tuple[bool, str, str]:
+        """Send input to the active shell for a session.
+        
+        Args:
+            host: Hostname or SSH config alias
+            input_text: Text to send (e.g., 'q\n' to quit pager)
+            username: SSH username (optional)
+            port: SSH port (optional)
+            
+        Returns:
+            Tuple of (success: bool, output: str, error: str)
+        """
+        _, _, _, _, session_key = self._resolve_connection(host, username, port)
+        
+        with self._lock:
+            if session_key not in self._session_shells:
+                return False, "", "No active shell for this session"
+            
+            shell = self._session_shells[session_key]
+            try:
+                shell.send(input_text)
+                time.sleep(0.2)
+                
+                output = ""
+                if shell.recv_ready():
+                    output = shell.recv(65535).decode('utf-8', errors='replace')
+                
+                return True, output, ""
+            except Exception as e:
+                return False, "", f"Failed to send input: {e}"
 
     def list_running_commands(self) -> list[dict]:
         """List all running async commands."""
@@ -1273,14 +1331,35 @@ class SSHSessionManager:
                     "status": cmd.status.value,
                     "start_time": cmd.start_time.isoformat()
                 }
-                for cmd in self._running_commands.values()
+                for cmd in self._commands.values()
+                if cmd.status == CommandStatus.RUNNING
             ]
+
+    def list_command_history(self, limit: int = 50) -> list[dict]:
+        """List recent command history (completed, failed, interrupted)."""
+        with self._lock:
+            completed = [
+                {
+                    "command_id": cmd.command_id,
+                    "session_key": cmd.session_key,
+                    "command": cmd.command,
+                    "status": cmd.status.value,
+                    "exit_code": cmd.exit_code,
+                    "start_time": cmd.start_time.isoformat(),
+                    "end_time": cmd.end_time.isoformat() if cmd.end_time else None
+                }
+                for cmd in self._commands.values()
+                if cmd.status != CommandStatus.RUNNING
+            ]
+            # Sort by end time, most recent first
+            completed.sort(key=lambda x: x['end_time'] or '', reverse=True)
+            return completed[:limit]
 
     def _cleanup_old_commands(self):
         """Remove old completed commands, keeping only recent ones."""
         with self._lock:
             completed = [
-                (cmd_id, cmd) for cmd_id, cmd in self._running_commands.items()
+                (cmd_id, cmd) for cmd_id, cmd in self._commands.items()
                 if cmd.status in [CommandStatus.COMPLETED, CommandStatus.FAILED, CommandStatus.INTERRUPTED]
             ]
             if len(completed) > self._max_completed_commands:
@@ -1288,4 +1367,4 @@ class SSHSessionManager:
                 completed.sort(key=lambda x: x[1].end_time or datetime.min)
                 to_remove = completed[:-self._max_completed_commands]
                 for cmd_id, _ in to_remove:
-                    del self._running_commands[cmd_id]
+                    del self._commands[cmd_id]

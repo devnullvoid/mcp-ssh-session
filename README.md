@@ -151,6 +151,15 @@ Interrupt a running async command by sending Ctrl+C.
 #### `list_running_commands`
 List all currently running async commands.
 
+#### `list_command_history`
+List recent command history (completed, failed, interrupted commands).
+
+```json
+{
+  "limit": 50
+}
+```
+
 #### `read_file`
 Read the contents of a remote file via SFTP, with optional sudo support.
 
