@@ -290,8 +290,8 @@ Commands complete when either:
 
 ## Documentation
 
-- [ASYNC_COMMANDS.md](ASYNC_COMMANDS.md) - Smart execution and async commands
-- [CLAUDE.md](CLAUDE.md) - Detailed usage documentation
+- [ASYNC_COMMANDS.md](/docs/ASYNC_COMMANDS.md) - Smart execution and async commands
+- [SAFETY_PROTECTIONS.md](/docs/SAFETY_PROTECTIONS.md)
 
 ## License
 
