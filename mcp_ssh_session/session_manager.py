@@ -25,37 +25,37 @@ class CommandValidator:
     MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 
     # Patterns that indicate streaming/indefinite commands
-    STREAMING_PATTERNS = [
-        r'\btail\s+.*-f\b',
-        r'\btail\s+.*--follow\b',
-        r'^watch\b',  # watch at start of command
-        r'\|\s*watch\b',  # watch in pipeline
-        r'^top\b',  # top at start of command
-        r'\|\s*top\b',  # top in pipeline
-        r'^htop\b',
-        r'\|\s*htop\b',
-        r'^less\b',  # less at start of command
-        r'\|\s*less\b',  # less in pipeline
-        r'^more\b',  # more at start of command
-        r'\|\s*more\b',  # more in pipeline
-        r'^vi\s',  # vi with arguments
-        r'^vim\s',  # vim with arguments
-        r'^nano\s',  # nano with arguments
-        r'^emacs\s',  # emacs with arguments
-        r'\b--follow\b',
-        r'\b-f\b.*\btail\b',
-        r'\bnc\s+.*-l\b',  # netcat listen mode
-        r'\bnetcat\s+.*-l\b',
-        r'^ssh\s',  # ssh command at start (nested SSH)
-        r'\|\s*ssh\s',  # ssh in pipeline
-        r'^telnet\s',  # telnet at start
-        r'\|\s*telnet\s',  # telnet in pipeline
-        r'^tcpdump\b',  # tcpdump at start
-        r'\|\s*tcpdump\b',
-        r'\bping\s+(?!.*-c\s+\d+)',  # ping without count flag
-        r'^monitor\s',  # Network device monitor commands at start
-        r'^debug\s',  # Debug commands at start
-    ]
+    # STREAMING_PATTERNS = [
+    #     r'\btail\s+.*-f\b',
+    #     r'\btail\s+.*--follow\b',
+    #     r'^watch\b',  # watch at start of command
+    #     r'\|\s*watch\b',  # watch in pipeline
+    #     r'^top\b',  # top at start of command
+    #     r'\|\s*top\b',  # top in pipeline
+    #     r'^htop\b',
+    #     r'\|\s*htop\b',
+    #     r'^less\b',  # less at start of command
+    #     r'\|\s*less\b',  # less in pipeline
+    #     r'^more\b',  # more at start of command
+    #     r'\|\s*more\b',  # more in pipeline
+    #     r'^vi\s',  # vi with arguments
+    #     r'^vim\s',  # vim with arguments
+    #     r'^nano\s',  # nano with arguments
+    #     r'^emacs\s',  # emacs with arguments
+    #     r'\b--follow\b',
+    #     r'\b-f\b.*\btail\b',
+    #     r'\bnc\s+.*-l\b',  # netcat listen mode
+    #     r'\bnetcat\s+.*-l\b',
+    #     r'^ssh\s',  # ssh command at start (nested SSH)
+    #     r'\|\s*ssh\s',  # ssh in pipeline
+    #     r'^telnet\s',  # telnet at start
+    #     r'\|\s*telnet\s',  # telnet in pipeline
+    #     r'^tcpdump\b',  # tcpdump at start
+    #     r'\|\s*tcpdump\b',
+    #     r'\bping\s+(?!.*-c\s+\d+)',  # ping without count flag
+    #     r'^monitor\s',  # Network device monitor commands at start
+    #     r'^debug\s',  # Debug commands at start
+    # ]
 
     # Patterns for background processes
     BACKGROUND_PATTERNS = [
@@ -731,7 +731,7 @@ class SSHSessionManager:
     def _get_or_create_shell(self, session_key: str, client: paramiko.SSHClient) -> Any:
         """Get or create a persistent shell for stateful command execution."""
         logger = self.logger.getChild('shell')
-        
+
         if session_key in self._session_shells:
             shell = self._session_shells[session_key]
             try:
@@ -780,7 +780,7 @@ class SSHSessionManager:
 
             last_recv_time = start_time
             idle_timeout = 2.0  # If no data for 2s after receiving some, assume done
-            
+
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
@@ -1077,7 +1077,7 @@ class SSHSessionManager:
                        sudo_password: Optional[str] = None,
                        timeout: int = 30) -> tuple[str, str, int]:
         """Execute a command on a host using persistent session.
-        
+
         All commands execute async internally. This polls until completion or timeout.
 
         Args:
@@ -1091,14 +1091,14 @@ class SSHSessionManager:
             enable_command: Command to enter enable mode (default: "enable")
             sudo_password: Password for sudo commands on Unix/Linux hosts (optional)
             timeout: Timeout in seconds for command execution (default: 30)
-            
+
         Returns:
             Tuple of (stdout, stderr, exit_code)
             If timeout reached, returns ("", "ASYNC:command_id", 124)
         """
         logger = self.logger.getChild('execute_command')
         logger.info(f"[EXEC_REQ] host={host}, cmd={command[:100]}..., timeout={timeout}")
-        
+
         # Validate command
         is_valid, error_msg = self._command_validator.validate_command(command)
         if not is_valid:
@@ -1121,7 +1121,7 @@ class SSHSessionManager:
             poll_count += 1
             if poll_count % 10 == 0:
                 logger.debug(f"[EXEC_POLL] count={poll_count}, status={status.get('status')}")
-            
+
             if 'error' in status:
                 logger.error(f"[EXEC_ERROR] {status['error']}")
                 return "", status['error'], 1
@@ -1144,16 +1144,16 @@ class SSHSessionManager:
         """Execute command in background thread and update running command state."""
         logger = self.logger.getChild('async_worker')
         logger.debug(f"[WORKER_START] command_id={command_id}")
-        
+
         try:
             with self._lock:
                 if command_id not in self._commands:
                     logger.error(f"[WORKER_NOTFOUND] command_id={command_id}")
                     return
                 running_cmd = self._commands[command_id]
-            
+
             logger.debug(f"[WORKER_EXEC] Executing command")
-            
+
             if sudo_password:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
@@ -1166,7 +1166,7 @@ class SSHSessionManager:
                 stdout, stderr, exit_code = self._execute_standard_command_internal(
                     client, command, timeout, session_key
                 )
-            
+
             logger.debug(f"[WORKER_DONE] exit_code={exit_code}")
             with self._lock:
                 if command_id in self._commands:
@@ -1197,7 +1197,7 @@ class SSHSessionManager:
                              enable_command: str = "enable",
                              timeout: int = 300) -> str:
         """Execute a command asynchronously without blocking.
-        
+
         Returns a command ID that can be used to check status and retrieve output.
         """
         logger = self.logger.getChild('execute_async')
@@ -1211,7 +1211,7 @@ class SSHSessionManager:
         shell = self._get_or_create_shell(session_key, client)
 
         command_id = str(uuid.uuid4())
-        
+
         running_cmd = RunningCommand(
             command_id=command_id,
             session_key=session_key,
@@ -1245,7 +1245,7 @@ class SSHSessionManager:
         with self._lock:
             if command_id not in self._commands:
                 return {"error": "Command ID not found"}
-            
+
             cmd = self._commands[command_id]
             return {
                 "command_id": cmd.command_id,
@@ -1264,11 +1264,11 @@ class SSHSessionManager:
         with self._lock:
             if command_id not in self._commands:
                 return False, f"Command ID {command_id} not found"
-            
+
             cmd = self._commands[command_id]
             if cmd.status != CommandStatus.RUNNING:
                 return False, f"Command {command_id} is not running (status: {cmd.status.value})"
-            
+
             try:
                 cmd.shell.send('\x03')  # Send Ctrl+C
                 cmd.status = CommandStatus.INTERRUPTED
@@ -1279,32 +1279,32 @@ class SSHSessionManager:
 
     def send_input(self, command_id: str, input_text: str) -> tuple[bool, str, str]:
         """Send input to a running command and return any new output.
-        
+
         Args:
             command_id: The command ID to send input to
             input_text: Text to send (e.g., 'q' to quit pager, 'y' for yes/no prompts)
-            
+
         Returns:
             Tuple of (success: bool, output: str, error: str)
         """
         with self._lock:
             if command_id not in self._commands:
                 return False, "", "Command ID not found"
-            
+
             cmd = self._commands[command_id]
             if cmd.status != CommandStatus.RUNNING:
                 return False, "", f"Command is not running (status: {cmd.status.value})"
-            
+
             try:
                 cmd.shell.send(input_text)
                 time.sleep(0.2)
-                
+
                 # Read any new output
                 output = ""
                 if cmd.shell.recv_ready():
                     output = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                     cmd.stdout += output
-                
+
                 return True, output, ""
             except Exception as e:
                 return False, "", f"Failed to send input: {e}"
@@ -1312,31 +1312,31 @@ class SSHSessionManager:
     def send_input_by_session(self, host: str, input_text: str, username: Optional[str] = None,
                                 port: Optional[int] = None) -> tuple[bool, str, str]:
         """Send input to the active shell for a session.
-        
+
         Args:
             host: Hostname or SSH config alias
             input_text: Text to send (e.g., 'q\n' to quit pager)
             username: SSH username (optional)
             port: SSH port (optional)
-            
+
         Returns:
             Tuple of (success: bool, output: str, error: str)
         """
         _, _, _, _, session_key = self._resolve_connection(host, username, port)
-        
+
         with self._lock:
             if session_key not in self._session_shells:
                 return False, "", "No active shell for this session"
-            
+
             shell = self._session_shells[session_key]
             try:
                 shell.send(input_text)
                 time.sleep(0.2)
-                
+
                 output = ""
                 if shell.recv_ready():
                     output = shell.recv(65535).decode('utf-8', errors='replace')
-                
+
                 return True, output, ""
             except Exception as e:
                 return False, "", f"Failed to send input: {e}"

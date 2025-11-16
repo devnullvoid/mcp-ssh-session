@@ -267,6 +267,23 @@ Then simply use:
 }
 ```
 
+## How It Works
+
+### Persistent Shell Sessions
+Commands execute in persistent interactive shells that maintain state:
+- Current directory persists across commands (`cd /tmp` stays in `/tmp`)
+- Environment variables remain set
+- Shell history is maintained
+
+### Smart Command Completion Detection
+Commands complete when either:
+1. **Prompt detected**: Standard shell prompts (`$`, `#`, `>`, `%`) at end of output
+2. **Idle timeout**: No output for 2 seconds after receiving data
+
+**Why idle timeout?** Custom themed prompts may not match standard patterns. The 2-second idle timeout ensures commands complete even with non-standard prompts.
+
+**Long-running commands**: The idle timer resets every time new output arrives, so builds or scripts that output sporadically continue running until naturally complete or the overall timeout is reached.
+
 ## Documentation
 
 - [ASYNC_COMMANDS.md](ASYNC_COMMANDS.md) - Smart execution and async commands

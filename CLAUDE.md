@@ -178,7 +178,26 @@ The core session management class that:
 - Handles interactive prompts for enable mode and sudo authentication
 - Tracks enable mode state per session to avoid re-authentication
 - Tracks active commands and provides a mechanism to interrupt them by sending a Ctrl+C signal
-- Uses `exec_command()` for standard SSH hosts and `invoke_shell()` for interactive scenarios
+- Uses persistent interactive shells (`invoke_shell()`) to maintain state across commands
+
+### Persistent Shell Sessions
+
+Commands execute in persistent interactive shells that maintain state:
+- **Current directory persists**: `cd /tmp` in one command stays in `/tmp` for the next
+- **Environment variables remain set**: `export VAR=value` persists across commands
+- **Shell history maintained**: Previous commands are in history
+- **One shell per session**: Reused across all commands to that host
+
+### Command Completion Detection
+
+Commands complete when either:
+
+1. **Prompt detected**: Standard shell prompts (`$`, `#`, `>`, `%`) at end of output
+2. **Idle timeout**: No output for 2 seconds after receiving data
+
+**Why idle timeout?** Custom themed prompts (colorized, multi-line, custom PS1) may not match standard patterns. The 2-second idle timeout ensures reliable completion regardless of prompt style.
+
+**Long-running commands**: The idle timer resets every time new output arrives. A build that outputs "Compiling file1.c" then waits 5 seconds then outputs "Compiling file2.c" continues running - the timer only triggers after the command naturally completes and goes silent.
 
 ### MCP Server
 Built with FastMCP, exposing SSH functionality as MCP tools that can be called by AI agents.
@@ -189,6 +208,8 @@ Built with FastMCP, exposing SSH functionality as MCP tools that can be called b
 - Passwords and keys are handled in memory only
 - Sessions are properly closed when no longer needed
 - Thread-safe operations prevent race conditions
+- Output limited to 10MB per command to prevent memory exhaustion
+- File operations capped at 2MB for safety
 
 ## Dependencies
 

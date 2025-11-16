@@ -141,3 +141,34 @@ else:
 - Output limited to 10MB per command
 - Auto-cleanup keeps last 100 completed commands
 - State tracked in memory (lost on server restart)
+
+## Command Completion Detection
+
+Commands complete when either:
+
+1. **Prompt detected**: Standard shell prompts (`$`, `#`, `>`, `%`) at end of output
+2. **Idle timeout**: No output for 2 seconds after receiving data
+
+### Why Idle Timeout?
+
+Custom themed prompts (e.g., colorized, multi-line, or custom PS1) may not match standard prompt patterns. The 2-second idle timeout ensures commands complete reliably regardless of prompt style.
+
+### Long-Running Commands
+
+The idle timer **resets every time new output arrives**:
+
+```python
+# Build that outputs sporadically - keeps running
+execute_command_async(host="server", command="make all", timeout=3600)
+# Outputs "Compiling file1.c" → timer resets
+# ... 5 seconds of silence ...
+# Outputs "Compiling file2.c" → timer resets
+# Continues until build completes or 3600s timeout
+
+# Command goes silent after completion - detects done
+execute_command(host="server", command="ls -la", timeout=30)
+# Outputs directory listing
+# 2 seconds of silence → command complete
+```
+
+**Key insight**: The 2s idle timeout only triggers after receiving some output. It's a completion detector, not a command killer.
