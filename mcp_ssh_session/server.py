@@ -347,7 +347,10 @@ def get_command_status(command_id: str) -> str:
         result += f"Ended: {status['end_time']}\n"
     if status['exit_code'] is not None:
         result += f"Exit Code: {status['exit_code']}\n"
-    
+    if status['awaiting_input_reason']:
+        result += f"Awaiting Input: {status['awaiting_input_reason']}\n"
+        result += f"  → Use send_input('{status['command_id']}', 'your_input\\n') to provide input\n"
+
     if status['stdout']:
         result += f"\nSTDOUT:\n{status['stdout']}\n"
     if status['stderr']:

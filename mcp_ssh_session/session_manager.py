@@ -403,30 +403,61 @@ class SSHSessionManager:
 
         logger = self.logger.getChild('detect_prompt')
         pattern: Optional[re.Pattern] = None
-        try:
-            stdin, stdout, stderr = client.exec_command('echo $PS1')
-            prompt = stdout.read().decode('utf-8').strip()
-            if prompt:
-                escaped = re.escape(prompt.strip())
-                pattern = re.compile(rf"{escaped}\s*$")
-        except Exception as exc:
-            logger.warning(f"Failed to read $PS1 for {session_key}: {exc}")
 
+        # Try to detect shell type
+        shell_type = self._session_shell_types.get(session_key, 'unknown').lower()
+        logger.debug(f"Detecting prompt pattern for {session_key}, shell: {shell_type}")
+
+        # For Fish shell, use a special pattern since it uses function-based prompts
+        if 'fish' in shell_type:
+            # Fish typically has a prompt ending with $ or >
+            pattern = re.compile(r"[>#\$]\s*$")
+            logger.debug("Using Fish shell prompt pattern")
+        else:
+            # Try to read $PS1 for other shells
+            try:
+                stdin, stdout, stderr = client.exec_command('echo $PS1')
+                prompt = stdout.read().decode('utf-8').strip()
+                if prompt and prompt != '$PS1':  # Make sure it's not literal $PS1
+                    escaped = re.escape(prompt.strip())
+                    pattern = re.compile(rf"{escaped}\s*$")
+                    logger.debug(f"Detected PS1 prompt: {prompt}")
+            except Exception as exc:
+                logger.warning(f"Failed to read $PS1 for {session_key}: {exc}")
+
+        # Fallback: extract from initial output
         if pattern is None and initial_output:
             fallback = self._extract_prompt_from_output(initial_output)
             if fallback:
                 escaped = re.escape(fallback)
                 pattern = re.compile(rf"{escaped}\s*$")
+                logger.debug(f"Using extracted prompt from output: {fallback}")
 
+        # Final fallback: generic prompt pattern
         if pattern is None:
             pattern = re.compile(r"[>#\$]\s*$")
+            logger.debug("Using generic prompt pattern")
 
         self._session_prompt_patterns[session_key] = pattern
         return pattern
 
     @staticmethod
     def _strip_ansi(text: str) -> str:
-        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        """Strip all ANSI escape sequences including CSI, OSC, and other types."""
+        # Remove CSI sequences: \x1b[...
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        # Remove OSC sequences: \x1b]...(\x07|\x1b\\)
+        text = re.sub(r"\x1b\][^\x07]*\x07", "", text)
+        text = re.sub(r"\x1b\][^\x1b]*\x1b\\", "", text)
+        # Remove other escape sequences
+        text = re.sub(r"\x1b[PX^_][^\x1b]*\x1b\\", "", text)
+        # Remove terminal UI noise like <N> (fish iTerm integration)
+        text = re.sub(r"<\d+>", "", text)
+        # Remove special characters that appear in terminal output (␤, ⏎, etc.)
+        text = re.sub(r"[\r\x00\u240c\u23ce]", "", text)  # CR, NUL, form feed symbol, return symbol
+        # Remove any remaining single control characters
+        text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+        return text
 
     @staticmethod
     def _extract_prompt_from_output(output: str) -> Optional[str]:
@@ -537,13 +568,40 @@ class SSHSessionManager:
             client, command, sudo_password, timeout
         )
 
+    def _detect_awaiting_input(self, output: str) -> Optional[str]:
+        """Detect if command is waiting for user input.
+
+        Returns string describing what input is needed, or None if not awaiting input.
+        """
+        # Common password prompts
+        if re.search(r'password[:\s]+$', output, re.IGNORECASE | re.MULTILINE):
+            return "password"
+        if re.search(r'passphrase[:\s]+$', output, re.IGNORECASE | re.MULTILINE):
+            return "passphrase"
+
+        # Pager prompts (less, more)
+        if re.search(r'^\s*\(END\)\s*$|^\s*:\s*$', output, re.MULTILINE):
+            return "pager"
+
+        # Yes/no prompts
+        if re.search(r'\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$',
+                     output, re.IGNORECASE | re.MULTILINE):
+            return "yes_no"
+
+        # Generic prompt at end (anything ending with ? or prompt-like)
+        if re.search(r'\?\s*$|-->?\s*$|enter [a-z\s]+[:\s]*$', output, re.IGNORECASE | re.MULTILINE):
+            return "user_input"
+
+        return None
+
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
-                                           timeout: int, session_key: str) -> tuple[str, str, int]:
-        """Execute a standard SSH command using the persistent session shell."""
+                                           timeout: int, session_key: str) -> tuple[str, str, int, Optional[str]]:
+        """Execute command with natural completion detection and interactive prompt detection.
+
+        Returns: (stdout, stderr, exit_code, awaiting_input_reason)
+        - awaiting_input_reason is None if complete, or a string describing what input is needed
+        """
         logger = self.logger.getChild('standard_command')
-        shell = None
-        marker = f"__MCP_DONE_{uuid.uuid4().hex}__"
-        marker_window = len(marker) + 32
 
         try:
             shell = self._get_or_create_shell(session_key, client)
@@ -552,77 +610,58 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
-            shell_type = self._ensure_shell_type(session_key, client)
-            prompt_pattern = self._ensure_prompt_pattern(session_key, client)
-            sentinel_command = self._build_sentinel_command(marker, shell_type)
-
-            command_to_send = command if command.endswith('\n') else f"{command}\n"
-            shell.send(command_to_send)
-            last_data_time = time.time()
-            marker_sent = False
-            time.sleep(0.1)
+            # Send command without sentinel - rely on prompt detection
+            shell.send(command + '\n')
+            time.sleep(0.3)
 
             output_limiter = OutputLimiter()
-            output_chunks: list[str] = []
+            raw_output = ""
             start_time = time.time()
-            marker_found = False
-            exit_code: Optional[int] = None
-            scan_buffer = ""
-            limit_hit = False
+            last_recv_time = start_time
+            idle_timeout = 2.0
+            prompt_pattern = self._ensure_prompt_pattern(session_key, client)
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
-                    chunk_bytes = shell.recv(4096)
-                    if not chunk_bytes:
-                        time.sleep(0.05)
-                        continue
-                    chunk = chunk_bytes.decode('utf-8', errors='ignore')
-                    last_data_time = time.time()
+                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    last_recv_time = time.time()
+                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                    raw_output += limited_chunk
 
-                    if not limit_hit:
-                        limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                        if limited_chunk:
-                            output_chunks.append(limited_chunk)
-                        if not should_continue:
-                            limit_hit = True
+                    if not should_continue:
+                        logger.warning("Output limit reached")
+                        return raw_output, "Output limit exceeded", 124, None
 
-                    scan_text = scan_buffer + chunk
-                    marker_index = scan_text.find(marker)
-                    if marker_index != -1:
-                        after_marker = scan_text[marker_index + len(marker):]
-                        if '\n' in after_marker:
-                            exit_text, _, _ = after_marker.partition('\n')
-                            exit_text = exit_text.strip()
-                            try:
-                                exit_code = int(exit_text or '0')
-                            except ValueError:
-                                exit_code = 1
-                            marker_found = True
-                            break
+                    # Check for interactive prompts BEFORE checking for completion
+                    awaiting = self._detect_awaiting_input(raw_output)
+                    if awaiting:
+                        logger.info(f"Detected interactive prompt: {awaiting}")
+                        return raw_output, "", 0, awaiting
 
-                    if not marker_sent:
-                        tail = self._strip_ansi(scan_text[-512:])
-                        if prompt_pattern and tail and prompt_pattern.search(tail):
-                            shell.send(sentinel_command)
-                            marker_sent = True
-                            continue
-
-                    scan_buffer = scan_text[-marker_window:]
+                    # Check for command completion (prompt at end of output)
+                    # Strip ANSI codes before checking for prompt
+                    clean_output = self._strip_ansi(raw_output)
+                    if prompt_pattern.search(clean_output):
+                        logger.debug(f"Detected command prompt - command complete")
+                        logger.debug(f"Clean output last 100 chars: {repr(clean_output[-100:])}")
+                        # Remove prompt and trailing whitespace from output
+                        output = prompt_pattern.sub('', clean_output).rstrip()
+                        return output, "", 0, None
                 else:
-                    if not marker_sent and (time.time() - last_data_time) > 0.5:
-                        shell.send(sentinel_command)
-                        marker_sent = True
-                    time.sleep(0.05)
-            else:
-                return ''.join(output_chunks), f"Command timed out after {timeout} seconds", 124
+                    # No data available - check if we should timeout from inactivity
+                    if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        logger.debug(f"Idle timeout after {idle_timeout}s - cleaning and returning output")
+                        output = self._strip_ansi(raw_output).rstrip()
+                        logger.debug(f"Cleaned output last 100 chars: {repr(output[-100:])}")
+                        # Try one more prompt check on cleaned output
+                        if prompt_pattern.search(output):
+                            logger.debug("Prompt found in cleaned output during idle timeout")
+                            output = prompt_pattern.sub('', output).rstrip()
+                        return output, "", 0, None
+                    time.sleep(0.1)
 
-            output = ''.join(output_chunks)
-            if marker_found and exit_code is not None:
-                sentinel = f"\n{marker}{exit_code}\n"
-                output = output.replace(sentinel, '\n')
-                return output.strip(), "", exit_code
-
-            return output.strip(), "", exit_code or 0
+            logger.warning(f"Command timed out after {timeout}s")
+            return raw_output.strip(), f"Command timed out after {timeout} seconds", 124, None
 
         except Exception as exc:
             logger.error(f"Error executing command: {exc}", exc_info=True)
@@ -632,7 +671,7 @@ class SSHSessionManager:
                 except Exception:
                     pass
                 del self._session_shells[session_key]
-            return "", f"Error: {exc}", 1
+            return "", f"Error: {exc}", 1, None
         finally:
             with self._lock:
                 self._active_commands.pop(session_key, None)

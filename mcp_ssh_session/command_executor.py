@@ -176,26 +176,33 @@ class CommandExecutor:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
                 )
+                awaiting_input_reason = None
             elif enable_password:
                 logger.debug(f"Executing in enable mode for {command_id}")
                 stdout, stderr, exit_code = self._execute_enable_mode_command_internal(
                     client, session_key, command, enable_password, enable_command, timeout
                 )
+                awaiting_input_reason = None
             else:
                 logger.debug(f"Executing as standard command for {command_id}")
-                stdout, stderr, exit_code = self._execute_standard_command_internal(
+                stdout, stderr, exit_code, awaiting_input_reason = self._execute_standard_command_internal(
                     client, command, timeout, session_key
                 )
 
-            logger.debug(f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}")
+            logger.debug(f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}, awaiting_input={awaiting_input_reason}")
             with self._lock:
                 if command_id in self._commands:
                     running_cmd.stdout = stdout
                     running_cmd.stderr = stderr
                     running_cmd.exit_code = exit_code
-                    running_cmd.status = CommandStatus.COMPLETED
-                    running_cmd.end_time = datetime.now()
-                    logger.info(f"Command {command_id} completed.")
+                    running_cmd.awaiting_input_reason = awaiting_input_reason
+                    if awaiting_input_reason:
+                        running_cmd.status = CommandStatus.AWAITING_INPUT
+                        logger.info(f"Command {command_id} awaiting input: {awaiting_input_reason}")
+                    else:
+                        running_cmd.status = CommandStatus.COMPLETED
+                        running_cmd.end_time = datetime.now()
+                        logger.info(f"Command {command_id} completed.")
         except Exception as e:
             logger.error(f"[WORKER_ERROR] command_id={command_id}, error={e}", exc_info=True)
             with self._lock:
@@ -228,7 +235,8 @@ class CommandExecutor:
                 "stderr": cmd.stderr,
                 "exit_code": cmd.exit_code,
                 "start_time": cmd.start_time.isoformat(),
-                "end_time": cmd.end_time.isoformat() if cmd.end_time else None
+                "end_time": cmd.end_time.isoformat() if cmd.end_time else None,
+                "awaiting_input_reason": cmd.awaiting_input_reason
             }
             logger.debug(f"Status for {command_id}: {status_payload['status']}")
             return status_payload
