@@ -66,6 +66,9 @@ def execute_command(
             sudo_password=sudo_password,
             timeout=timeout,
         )
+    except ConnectionError as e:
+        logger.error(f"Connection error: {e}")
+        return f"Connection Error: {e}"
     except Exception as e:
         logger.error(f"Exception during execute_command: {e}", exc_info=True)
         return f"Error: {e}"
@@ -313,6 +316,9 @@ def execute_command_async(
             port=port,
             timeout=timeout
         )
+    except ConnectionError as e:
+        logger.error(f"Connection error: {e}")
+        return f"Connection Error: {e}"
     except Exception as e:
         logger.error(f"Exception during execute_command_async: {e}", exc_info=True)
         return f"Error: {e}"
