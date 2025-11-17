@@ -276,16 +276,39 @@ class CommandExecutor:
                 return False, "", "Command ID not found"
 
             cmd = self._commands[command_id]
-            if cmd.status != CommandStatus.RUNNING:
-                logger.warning(f"Command is not running (status: {cmd.status.value})")
-                return False, "", f"Command is not running (status: {cmd.status.value})"
+            # Allow sending input to commands that are RUNNING or AWAITING_INPUT
+            if cmd.status not in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
+                logger.warning(f"Command is not active (status: {cmd.status.value})")
+                return False, "", f"Command is not active (status: {cmd.status.value})"
 
             try:
-                logger.debug(f"Sending text to shell: {input_text!r}")
-                cmd.shell.send(input_text)
+                # Handle escaped newlines - convert literal \n to actual newlines
+                # This handles cases where the client sends 'password\n' as literal characters
+                processed_input = input_text.replace('\\n', '\n').replace('\\r', '\r')
+                logger.debug(f"Original input: {input_text!r}")
+                logger.debug(f"Processed input: {processed_input!r}")
+                logger.debug(f"Input length: {len(processed_input)}, ends with newline: {processed_input.endswith(chr(10))}")
+                bytes_sent = cmd.shell.send(processed_input)
+                logger.debug(f"Sent {bytes_sent} bytes to shell")
                 time.sleep(0.2)
 
-                # Read any new output
+                # If command was awaiting input, transition back to RUNNING and continue monitoring
+                if cmd.status == CommandStatus.AWAITING_INPUT:
+                    cmd.status = CommandStatus.RUNNING
+                    cmd.awaiting_input_reason = None  # Clear the awaiting input reason
+                    logger.info(f"Command {command_id} transitioned from AWAITING_INPUT to RUNNING after input sent")
+
+                    # Submit a background task to continue monitoring for command completion
+                    # We don't wait for it - that would block the MCP server
+                    logger.debug(f"Submitting background monitoring task for {command_id}")
+                    future = self._executor.submit(
+                        self._continue_monitoring_shell_background,
+                        command_id, cmd
+                    )
+                    logger.debug(f"Background monitoring submitted for {command_id}")
+                    return True, "", ""
+
+                # Read any new output (for commands that were already RUNNING)
                 output = ""
                 if cmd.shell.recv_ready():
                     output = cmd.shell.recv(65535).decode('utf-8', errors='replace')
@@ -296,6 +319,59 @@ class CommandExecutor:
             except Exception as e:
                 logger.error(f"Failed to send input: {e}", exc_info=True)
                 return False, "", f"Failed to send input: {e}"
+
+    def _continue_monitoring_shell_background(self, command_id: str, cmd: Any) -> None:
+        """Background task to monitor shell output after input has been sent.
+
+        Updates command status when completion is detected.
+        Runs in background thread pool, does not block caller.
+        """
+        logger = self.logger.getChild('continue_monitoring_bg')
+        logger.info(f"[BG_MONITOR_START] command_id={command_id}")
+
+        idle_timeout = 2.0
+        last_recv_time = time.time()
+        start_time = time.time()
+        max_timeout = 60  # Max 60 seconds to wait for completion
+
+        try:
+            while time.time() - start_time < max_timeout:
+                try:
+                    if cmd.shell.recv_ready():
+                        chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
+                        if chunk:
+                            with self._lock:
+                                if command_id in self._commands:
+                                    cmd.stdout += chunk
+                            last_recv_time = time.time()
+                            logger.debug(f"[BG_MONITOR_RECV] Received {len(chunk)} bytes: {repr(chunk[:100])}")
+                        else:
+                            logger.debug(f"[BG_MONITOR_EMPTY] recv() returned empty chunk")
+                    else:
+                        # No data available - check if we've timed out from inactivity
+                        elapsed_idle = time.time() - last_recv_time
+                        if elapsed_idle > idle_timeout:
+                            logger.info(f"[BG_MONITOR_COMPLETE] Idle timeout ({elapsed_idle:.1f}s) - command complete")
+
+                            # Update command status to completed
+                            with self._lock:
+                                if command_id in self._commands:
+                                    cmd.status = CommandStatus.COMPLETED
+                                    cmd.end_time = datetime.now()
+                                    logger.info(f"[BG_MONITOR_FINAL] Command {command_id} completed after input")
+                            break
+
+                        time.sleep(0.1)
+                except Exception as recv_error:
+                    logger.error(f"[BG_MONITOR_RECV_ERROR] Error receiving data: {recv_error}")
+                    break
+        except Exception as e:
+            logger.error(f"[BG_MONITOR_ERROR] Error in background monitoring: {e}", exc_info=True)
+            with self._lock:
+                if command_id in self._commands:
+                    cmd.status = CommandStatus.FAILED
+                    cmd.stderr = str(e)
+                    cmd.end_time = datetime.now()
 
     def list_running_commands(self) -> list[dict]:
         """List all running async commands."""

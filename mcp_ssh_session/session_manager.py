@@ -573,10 +573,10 @@ class SSHSessionManager:
 
         Returns string describing what input is needed, or None if not awaiting input.
         """
-        # Common password prompts
-        if re.search(r'password[:\s]+$', output, re.IGNORECASE | re.MULTILINE):
+        # Common password prompts - match various formats like "password:", "password for user:", etc.
+        if re.search(r'password[^:]*:?\s*$', output, re.IGNORECASE | re.MULTILINE):
             return "password"
-        if re.search(r'passphrase[:\s]+$', output, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'passphrase[^:]*:?\s*$', output, re.IGNORECASE | re.MULTILINE):
             return "passphrase"
 
         # Pager prompts (less, more)
@@ -653,6 +653,13 @@ class SSHSessionManager:
                         logger.debug(f"Idle timeout after {idle_timeout}s - cleaning and returning output")
                         output = self._strip_ansi(raw_output).rstrip()
                         logger.debug(f"Cleaned output last 100 chars: {repr(output[-100:])}")
+
+                        # Check for interactive prompts BEFORE checking for completion
+                        awaiting = self._detect_awaiting_input(raw_output)
+                        if awaiting:
+                            logger.info(f"Detected interactive prompt during idle timeout: {awaiting}")
+                            return raw_output, "", 0, awaiting
+
                         # Try one more prompt check on cleaned output
                         if prompt_pattern.search(output):
                             logger.debug("Prompt found in cleaned output during idle timeout")
