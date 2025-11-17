@@ -316,7 +316,7 @@ def execute_command_async(
     except Exception as e:
         logger.error(f"Exception during execute_command_async: {e}", exc_info=True)
         return f"Error: {e}"
-    
+
     response = f"Command started with ID: {command_id}\n\nUse get_command_status('{command_id}') to check progress."
     logger.info(f"Async command started with ID: {command_id}")
     return response
