@@ -56,6 +56,10 @@ class CommandExecutor:
         # Poll until done or timeout
         start = time.time()
         poll_count = 0
+        idle_threshold = getattr(self._session_manager, 'SYNC_IDLE_TO_ASYNC', 0)
+        last_activity = start
+        last_stdout = ""
+        last_stderr = ""
         while time.time() - start < timeout:
             status = self.get_command_status(command_id)
             poll_count += 1
@@ -68,6 +72,18 @@ class CommandExecutor:
             if status['status'] != 'running':
                 logger.info(f"[EXEC_DONE] status={status['status']}, polls={poll_count}, duration={time.time() - start:.2f}s")
                 return status['stdout'], status['stderr'], status['exit_code'] or 0
+
+            if idle_threshold and idle_threshold > 0:
+                if status['stdout'] != last_stdout or status['stderr'] != last_stderr:
+                    last_activity = time.time()
+                    last_stdout = status['stdout']
+                    last_stderr = status['stderr']
+                elif time.time() - last_activity >= idle_threshold:
+                    logger.info(
+                        f"[EXEC_IDLE_ASYNC] No new output for {idle_threshold}s, switching to async command_id={command_id}"
+                    )
+                    return "", f"ASYNC:{command_id}", 124
+
             time.sleep(0.1)
 
         # Timeout - return command ID

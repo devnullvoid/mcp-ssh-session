@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -29,6 +30,9 @@ class SSHSessionManager:
     # Thread pool for timeout enforcement
     MAX_WORKERS = 10
 
+    # Time (seconds) to wait for new output before switching sync commands to async
+    SYNC_IDLE_TO_ASYNC = 2.0
+
     # Maximum bytes allowed for file read/write operations (2MB)
     MAX_FILE_TRANSFER_SIZE = 2 * 1024 * 1024
 
@@ -36,6 +40,9 @@ class SSHSessionManager:
         self._sessions: Dict[str, paramiko.SSHClient] = {}
         self._enable_mode: Dict[str, bool] = {}  # Track which sessions are in enable mode
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
+        self._session_shell_types: Dict[str, str] = {}
+        self._session_prompt_patterns: Dict[str, re.Pattern] = {}
+        self._session_shell_types: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
         self._command_validator = CommandValidator()
@@ -115,6 +122,7 @@ class SSHSessionManager:
                     transport = client.get_transport()
                     if transport and transport.is_active():
                         logger.debug(f"Reusing active session: {session_key}")
+                        self._ensure_shell_type(session_key, client)
                         return client
                     else:
                         logger.warning(f"Found dead session, will recreate: {session_key}")
@@ -150,6 +158,7 @@ class SSHSessionManager:
             try:
                 client.connect(**connect_kwargs)
                 self._sessions[session_key] = client
+                self._ensure_shell_type(session_key, client)
                 logger.info(f"Successfully created new session: {session_key}")
                 return client
             except Exception as e:
@@ -265,6 +274,10 @@ class SSHSessionManager:
             except Exception as e:
                 logger.warning(f"Error closing client for {session_key}: {e}")
             del self._sessions[session_key]
+        self._session_shell_types.pop(session_key, None)
+        self._session_prompt_patterns.pop(session_key, None)
+        if session_key in self._session_shell_types:
+            del self._session_shell_types[session_key]
 
         # Clean up enable mode tracking
         if session_key in self._enable_mode:
@@ -296,6 +309,9 @@ class SSHSessionManager:
                     logger.warning(f"Error closing client for {key}: {e}")
             self._sessions.clear()
             self._enable_mode.clear()
+            self._session_shell_types.clear()
+            self._session_prompt_patterns.clear()
+            self._session_shell_types.clear()
         
         logger.info("All sessions closed.")
 
@@ -341,6 +357,10 @@ class SSHSessionManager:
                     del self._session_shells[session_key]
                 else:
                     logger.debug(f"[SHELL_REUSE] Reusing existing shell for {session_key}")
+                    client_ref = self._sessions.get(session_key)
+                    if client_ref:
+                        self._ensure_shell_type(session_key, client_ref)
+                        self._ensure_prompt_pattern(session_key, client_ref)
                     return shell
             except Exception as exc:
                 logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {exc}. Recreating.")
@@ -350,12 +370,90 @@ class SSHSessionManager:
         logger.info(f"[SHELL_CREATE] Creating new persistent shell for {session_key}")
         shell = client.invoke_shell()
         time.sleep(0.5)
+        initial_output = ''
         if shell.recv_ready():
             initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
             logger.debug(f"[SHELL_CREATE] Initial shell output: {initial_output!r}")
         self._session_shells[session_key] = shell
+        self._ensure_shell_type(session_key, client)
+        self._ensure_prompt_pattern(session_key, client, initial_output or None)
         logger.info(f"[SHELL_READY] New shell for {session_key} is ready.")
         return shell
+
+    def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
+        if session_key in self._session_shell_types:
+            return self._session_shell_types[session_key]
+
+        logger = self.logger.getChild('detect_shell')
+        try:
+            stdin, stdout, stderr = client.exec_command('echo $SHELL')
+            shell_path = stdout.read().decode('utf-8').strip() or 'unknown'
+            self._session_shell_types[session_key] = shell_path
+            logger.debug(f"Detected shell for {session_key}: {shell_path}")
+            return shell_path
+        except Exception as exc:
+            logger.warning(f"Failed to detect shell type for {session_key}: {exc}")
+            self._session_shell_types[session_key] = 'unknown'
+            return 'unknown'
+
+    def _ensure_prompt_pattern(self, session_key: str, client: paramiko.SSHClient,
+                               initial_output: Optional[str] = None) -> re.Pattern:
+        if session_key in self._session_prompt_patterns:
+            return self._session_prompt_patterns[session_key]
+
+        logger = self.logger.getChild('detect_prompt')
+        pattern: Optional[re.Pattern] = None
+        try:
+            stdin, stdout, stderr = client.exec_command('echo $PS1')
+            prompt = stdout.read().decode('utf-8').strip()
+            if prompt:
+                escaped = re.escape(prompt.strip())
+                pattern = re.compile(rf"{escaped}\s*$")
+        except Exception as exc:
+            logger.warning(f"Failed to read $PS1 for {session_key}: {exc}")
+
+        if pattern is None and initial_output:
+            fallback = self._extract_prompt_from_output(initial_output)
+            if fallback:
+                escaped = re.escape(fallback)
+                pattern = re.compile(rf"{escaped}\s*$")
+
+        if pattern is None:
+            pattern = re.compile(r"[>#\$]\s*$")
+
+        self._session_prompt_patterns[session_key] = pattern
+        return pattern
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+    @staticmethod
+    def _extract_prompt_from_output(output: str) -> Optional[str]:
+        lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+        for line in reversed(lines):
+            stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
+            if stripped and stripped[-1] in ('$', '#', '>', '%'):
+                return stripped.strip()
+        return None
+
+
+    def _build_sentinel_command(self, marker: str, shell_path: str) -> str:
+        lower = shell_path.lower()
+        if 'fish' in lower:
+            return (
+                "set -l __mcp_status $status; "
+                f"printf '\\n{marker}%d\\n' $__mcp_status\n"
+            )
+        if lower.endswith('csh') or 'tcsh' in lower:
+            return (
+                "set __mcp_status=$status; "
+                f"echo \"{marker}$__mcp_status\"\n"
+            )
+        return (
+            "__mcp_status=$?; "
+            f"printf '\\n{marker}%d\\n' \"$__mcp_status\" 2>/dev/null || echo \"{marker}$__mcp_status\"\n"
+        )
 
     def _execute_with_thread_timeout(self, func, timeout: int, *args, **kwargs) -> Tuple[str, str, int]:
         """Legacy wrapper retained for compatibility (no additional timeout logic)."""
@@ -444,6 +542,9 @@ class SSHSessionManager:
         """Execute a standard SSH command using the persistent session shell."""
         logger = self.logger.getChild('standard_command')
         shell = None
+        marker = f"__MCP_DONE_{uuid.uuid4().hex}__"
+        marker_window = len(marker) + 32
+
         try:
             shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
@@ -451,46 +552,77 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
-            shell.send(command + '\n')
-            time.sleep(0.3)
+            shell_type = self._ensure_shell_type(session_key, client)
+            prompt_pattern = self._ensure_prompt_pattern(session_key, client)
+            sentinel_command = self._build_sentinel_command(marker, shell_type)
+
+            command_to_send = command if command.endswith('\n') else f"{command}\n"
+            shell.send(command_to_send)
+            last_data_time = time.time()
+            marker_sent = False
+            time.sleep(0.1)
 
             output_limiter = OutputLimiter()
-            output = ""
+            output_chunks: list[str] = []
             start_time = time.time()
-            last_recv_time = start_time
-            idle_timeout = 2.0
+            marker_found = False
+            exit_code: Optional[int] = None
+            scan_buffer = ""
+            limit_hit = False
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
-                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                    limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    output += limited_chunk
-                    last_recv_time = time.time()
+                    chunk_bytes = shell.recv(4096)
+                    if not chunk_bytes:
+                        time.sleep(0.05)
+                        continue
+                    chunk = chunk_bytes.decode('utf-8', errors='ignore')
+                    last_data_time = time.time()
 
-                    if not should_continue:
-                        logger.warning("Output size limit exceeded")
-                        break
+                    if not limit_hit:
+                        limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                        if limited_chunk:
+                            output_chunks.append(limited_chunk)
+                        if not should_continue:
+                            limit_hit = True
 
-                    lines = output.split('\n')
-                    if len(lines) > 1 and lines[-1].strip().endswith(('$', '#', '>', '%')):
-                        time.sleep(0.2)
-                        if shell.recv_ready():
-                            more = shell.recv(4096).decode('utf-8', errors='ignore')
-                            limited_more, _ = output_limiter.add_chunk(more)
-                            output += limited_more
-                        break
+                    scan_text = scan_buffer + chunk
+                    marker_index = scan_text.find(marker)
+                    if marker_index != -1:
+                        after_marker = scan_text[marker_index + len(marker):]
+                        if '\n' in after_marker:
+                            exit_text, _, _ = after_marker.partition('\n')
+                            exit_text = exit_text.strip()
+                            try:
+                                exit_code = int(exit_text or '0')
+                            except ValueError:
+                                exit_code = 1
+                            marker_found = True
+                            break
+
+                    if not marker_sent:
+                        tail = self._strip_ansi(scan_text[-512:])
+                        if prompt_pattern and tail and prompt_pattern.search(tail):
+                            shell.send(sentinel_command)
+                            marker_sent = True
+                            continue
+
+                    scan_buffer = scan_text[-marker_window:]
                 else:
-                    if output and (time.time() - last_recv_time) > idle_timeout:
-                        break
-                    time.sleep(0.1)
+                    if not marker_sent and (time.time() - last_data_time) > 0.5:
+                        shell.send(sentinel_command)
+                        marker_sent = True
+                    time.sleep(0.05)
             else:
-                return output, f"Command timed out after {timeout} seconds", 124
+                return ''.join(output_chunks), f"Command timed out after {timeout} seconds", 124
 
-            lines = output.split('\n')
-            if len(lines) > 1:
-                output = '\n'.join(lines[1:-1]).strip()
+            output = ''.join(output_chunks)
+            if marker_found and exit_code is not None:
+                sentinel = f"\n{marker}{exit_code}\n"
+                output = output.replace(sentinel, '\n')
+                return output.strip(), "", exit_code
 
-            return output, "", 0
+            return output.strip(), "", exit_code or 0
 
         except Exception as exc:
             logger.error(f"Error executing command: {exc}", exc_info=True)
