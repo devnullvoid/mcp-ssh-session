@@ -800,6 +800,10 @@ class SSHSessionManager:
         if re.search(r'\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$',
                      output, re.IGNORECASE | re.MULTILINE):
             return "yes_no"
+            
+        # Press any key / continue
+        if re.search(r'press any key|press enter|to continue', output, re.IGNORECASE | re.MULTILINE):
+            return "press_key"
 
         # Generic prompt at end (anything ending with ? or prompt-like)
         if re.search(r'\?\s*$|-->?\s*$|enter [a-z\s]+[:\s]*$', output, re.IGNORECASE | re.MULTILINE):

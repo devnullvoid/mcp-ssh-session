@@ -74,16 +74,32 @@ def execute_command(
         return f"Error: {e}"
 
     # Check if command transitioned to async mode
-    if exit_status == 124 and stderr.startswith("ASYNC:"):
-        command_id = stderr.split(":", 1)[1]
-        response = (
-            f"Command exceeded timeout of {timeout}s and is now running in background.\n\n"
-            f"Command ID: {command_id}\n\n"
-            f"Use get_command_status('{command_id}') to check progress.\n"
-            f"Use interrupt_command_by_id('{command_id}') to stop it."
-        )
-        logger.warning(f"Command timed out, returning async response for command_id {command_id}")
-        return response
+    if exit_status == 124:
+        if stderr.startswith("ASYNC:"):
+            command_id = stderr.split(":", 1)[1]
+            response = (
+                f"Command exceeded timeout of {timeout}s and is now running in background.\n\n"
+                f"Command ID: {command_id}\n\n"
+                f"Use get_command_status('{command_id}') to check progress.\n"
+                f"Use interrupt_command_by_id('{command_id}') to stop it."
+            )
+            logger.warning(f"Command timed out, returning async response for command_id {command_id}")
+            return response
+            
+        if stderr.startswith("AWAITING_INPUT:"):
+            # Format: AWAITING_INPUT:command_id:reason
+            parts = stderr.split(":", 2)
+            command_id = parts[1]
+            reason = parts[2] if len(parts) > 2 else "unknown"
+            
+            response = (
+                f"Command paused waiting for user input ({reason}).\n\n"
+                f"Command ID: {command_id}\n\n"
+                f"Use send_input('{command_id}', 'your_input\\n') to provide input.\n"
+                f"For example, if it's a password, provide the password followed by \\n."
+            )
+            logger.info(f"Command awaiting input, returning instructions for command_id {command_id}")
+            return response
 
     result = f"Exit Status: {exit_status}\n\n"
     if stdout:

@@ -69,26 +69,30 @@ class CommandExecutor:
             if 'error' in status:
                 logger.error(f"[EXEC_ERROR] {status['error']}")
                 return "", status['error'], 1
+            
+            if status['status'] == 'awaiting_input':
+                reason = status.get('awaiting_input_reason', 'unknown')
+                logger.info(f"[EXEC_AWAIT] Command {command_id} waiting for input: {reason}")
+                # Return immediately for awaiting input, let the tool handle it.
+                return "", f"AWAITING_INPUT:{command_id}:{reason}", 124
+                
             if status['status'] != 'running':
                 logger.info(f"[EXEC_DONE] status={status['status']}, polls={poll_count}, duration={time.time() - start:.2f}s")
                 return status['stdout'], status['stderr'], status['exit_code'] or 0
 
-            if idle_threshold and idle_threshold > 0:
-                if status['stdout'] != last_stdout or status['stderr'] != last_stderr:
-                    last_activity = time.time()
-                    last_stdout = status['stdout']
-                    last_stderr = status['stderr']
-                elif time.time() - last_activity >= idle_threshold:
-                    logger.info(
-                        f"[EXEC_IDLE_ASYNC] No new output for {idle_threshold}s, switching to async command_id={command_id}"
-                    )
-                    return "", f"ASYNC:{command_id}", 124
+            # If the command is running but has been idle for SYNC_IDLE_TO_ASYNC, it means it *should* transition to async
+            # and we should continue polling until the full timeout for this sync execute_command call.
+            # The `_execute_standard_command_internal` function will return `ASYNC:{command_id}` if it hits its idle timeout.
+            # The outer `execute_command` (sync tool) should then continue to poll this async ID.
+            # This block is for when the *internal* async transition happens, but the outer sync call should keep waiting.
+            # If we reached here, it means the internal worker is still 'running' but might be idle or waiting internally.
 
             time.sleep(0.1)
 
-        # Timeout - return command ID
-        logger.warning(f"[EXEC_TIMEOUT] Returning async command_id after {timeout}s")
-        return "", f"ASYNC:{command_id}", 124
+        # If we reach here, the command genuinely timed out based on the outer `timeout` parameter.
+        logger.warning(f"[EXEC_TIMEOUT] Command {command_id} timed out after {timeout}s")
+        status_on_timeout = self.get_command_status(command_id)
+        return status_on_timeout.get('stdout', ''), f"Command timed out after {timeout} seconds", 124
 
     def execute_command_async(self, host: str, username: Optional[str] = None,
                              command: str = "", password: Optional[str] = None,
@@ -109,9 +113,9 @@ class CommandExecutor:
         # Check if a command is already running for this session
         with self._lock:
             for cmd in self._commands.values():
-                if cmd.session_key == session_key and cmd.status == CommandStatus.RUNNING:
+                if cmd.session_key == session_key and cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
                     error_msg = (
-                        f"A command is already running in this session ({session_key}).\n"
+                        f"A command is already running or awaiting input in this session ({session_key}).\n"
                         f"Running Command ID: {cmd.command_id}\n"
                         f"Running Command Status: {cmd.status.value}"
                     )
