@@ -42,7 +42,7 @@ class SSHSessionManager:
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
         self._session_shell_types: Dict[str, str] = {}
         self._session_prompt_patterns: Dict[str, re.Pattern] = {}
-        self._session_shell_types: Dict[str, str] = {}
+        self._prompt_miss_count: Dict[str, int] = {}  # Track failed prompt matches for regeneration
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
         self._command_validator = CommandValidator()
@@ -379,7 +379,7 @@ class SSHSessionManager:
                     client_ref = self._sessions.get(session_key)
                     if client_ref:
                         self._ensure_shell_type(session_key, client_ref)
-                        self._ensure_prompt_pattern(session_key, client_ref)
+                        self._ensure_prompt_pattern(session_key, client_ref, shell=shell)
                     return shell
             except Exception as exc:
                 logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {exc}. Recreating.")
@@ -466,7 +466,16 @@ class SSHSessionManager:
         return 'unknown'
 
     def _ensure_prompt_pattern(self, session_key: str, client: paramiko.SSHClient,
-                               initial_output: Optional[str] = None) -> re.Pattern:
+                               initial_output: Optional[str] = None,
+                               shell: Optional[Any] = None) -> re.Pattern:
+        """Detect and cache shell prompt pattern for reliable command completion detection.
+
+        Args:
+            session_key: Session identifier
+            client: SSH client (used for exec_command fallback)
+            initial_output: Initial shell output to analyze
+            shell: Interactive shell (preferred for reading PS1)
+        """
         if session_key in self._session_prompt_patterns:
             return self._session_prompt_patterns[session_key]
 
@@ -479,59 +488,55 @@ class SSHSessionManager:
         logger.debug(f"Detecting prompt pattern for {session_key}, shell: {shell_type}")
         logger.debug(f"[PATTERN_CREATE] Initial output: {repr(initial_output) if initial_output else 'None'}")
 
-        # For Fish shell, use a special pattern since it uses function-based prompts
+        # For Fish shell, use a more specific pattern to avoid false positives
         if 'fish' in shell_type:
-            # Fish typically has a prompt ending with $ or >
-            pattern = re.compile(r"[>#\$]\s*$")
+            # Fish prompts typically have context before the prompt character
+            pattern = re.compile(r"(\S+\s+)?[>#\$]\s*$")
             logger.debug("Using Fish shell prompt pattern")
         else:
-            # Try to read $PS1 for other shells (only if we have a client)
-            if client:
+            # Try to read $PS1 from interactive shell (preferred) or exec_command (fallback)
+            if shell:
                 try:
+                    logger.debug("[PATTERN_CREATE] Reading PS1 from interactive shell")
+                    # Use markers to extract PS1 from shell output
+                    shell.send('echo "___PS1_START___$PS1___PS1_END___"\n')
+                    time.sleep(0.5)
+
+                    output = ""
+                    start_time = time.time()
+                    while time.time() - start_time < 3:
+                        if shell.recv_ready():
+                            chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                            output += chunk
+                            if '___PS1_END___' in output:
+                                break
+                        time.sleep(0.1)
+
+                    # Extract PS1 between markers
+                    match = re.search(r'___PS1_START___(.+?)___PS1_END___', output, re.DOTALL)
+                    if match:
+                        prompt = match.group(1).strip()
+                        logger.debug(f"[PATTERN_CREATE] PS1 from shell: {repr(prompt)}")
+                        if prompt and prompt != '$PS1':
+                            pattern = self._convert_ps1_to_pattern(prompt, logger)
+                    else:
+                        logger.debug(f"[PATTERN_CREATE] Could not extract PS1 from shell output")
+                except Exception as exc:
+                    logger.warning(f"Failed to read PS1 from shell for {session_key}: {exc}")
+
+            # Fallback to exec_command if shell method didn't work
+            if pattern is None and client:
+                try:
+                    logger.debug("[PATTERN_CREATE] Falling back to exec_command for PS1")
                     stdin, stdout, stderr = client.exec_command('echo $PS1', timeout=10)
                     prompt = stdout.read().decode('utf-8').strip()
                     logger.debug(f"[PATTERN_CREATE] PS1 raw result: {repr(prompt)}")
-                    if prompt and prompt != '$PS1':  # Make sure it's not literal $PS1
-                        logger.debug(f"[PATTERN_CREATE] Converting PS1: {prompt}")
-                        # Convert PS1 variables to flexible regex patterns
-                        pattern_str = prompt
-                        pattern_str = pattern_str.replace('\\u', '[^@\\s]+')  # username
-                        pattern_str = pattern_str.replace('\\h', '[^\\s\\]]+')  # hostname
-                        pattern_str = pattern_str.replace('\\H', '[^\\s\\]]+')  # full hostname
-                        pattern_str = pattern_str.replace('\\W', '[^\\]\\s]*')   # working dir basename
-                        pattern_str = pattern_str.replace('\\w', '[^\\]\\s]*')   # full working dir
-                        pattern_str = pattern_str.replace('\\$', '[$#]')     # $ or #
-
-                        logger.debug(f"[PATTERN_CREATE] After PS1 conversion: {pattern_str}")
-
-                        # Now escape special regex chars, but preserve our bracket patterns
-                        # First mark our patterns to protect them
-                        pattern_str = pattern_str.replace('[^@\\s]+', '___USERNAME___')
-                        pattern_str = pattern_str.replace('[^\\s\\]]+', '___HOSTNAME___')
-                        pattern_str = pattern_str.replace('[^\\]\\s]*', '___DIRNAME___')
-                        pattern_str = pattern_str.replace('[$#]', '___PROMPT___')
-
-                        logger.debug(f"[PATTERN_CREATE] After marking: {pattern_str}")
-
-                        # Escape everything else
-                        pattern_str = re.escape(pattern_str)
-
-                        logger.debug(f"[PATTERN_CREATE] After escaping: {pattern_str}")
-
-                        # Restore our patterns
-                        pattern_str = pattern_str.replace('___USERNAME___', '[^@\\s]+')
-                        pattern_str = pattern_str.replace('___HOSTNAME___', '[^\\s\\]]+')
-                        pattern_str = pattern_str.replace('___DIRNAME___', '[^\\]\\s]*')
-                        pattern_str = pattern_str.replace('___PROMPT___', '[$#]')
-
-                        pattern = re.compile(rf"{pattern_str}\s*$")
-                        logger.debug(f"Detected PS1 prompt: {prompt} -> pattern: {pattern_str}")
+                    if prompt and prompt != '$PS1':
+                        pattern = self._convert_ps1_to_pattern(prompt, logger)
                     else:
                         logger.debug(f"[PATTERN_CREATE] PS1 not usable: {repr(prompt)}")
                 except Exception as exc:
                     logger.warning(f"Failed to read $PS1 for {session_key}: {exc}")
-            else:
-                logger.debug(f"[PATTERN_CREATE] No client provided, skipping PS1 detection")
 
         # Fallback: extract from initial output
         if pattern is None and initial_output:
@@ -540,8 +545,8 @@ class SSHSessionManager:
                 logger.debug(f"[PATTERN_CREATE] Extracted prompt: {fallback}")
                 # Make extracted prompt flexible for directory changes
                 if '[' in fallback and ']' in fallback:
-                    # Convert [user@host dir]$ to flexible pattern
-                    flexible_pattern = r'\[[^@]+@[^\]]+\][$#]\s*$'
+                    # Support both [user@host dir]$ and [host]$ patterns
+                    flexible_pattern = r'\[[^@\]]+(@[^\]]+)?\][$#]\s*$'
                     pattern = re.compile(flexible_pattern)
                     logger.debug(f"Using flexible bracketed pattern: {flexible_pattern}")
                 else:
@@ -549,15 +554,12 @@ class SSHSessionManager:
                     pattern = re.compile(rf"{escaped}\s*$")
                     logger.debug(f"Using extracted prompt from output: {fallback}")
 
-        # Enhanced fallback: try common prompt patterns
+        # Enhanced fallback: try common prompt patterns with scoring
         if pattern is None:
             logger.debug(f"[PATTERN_CREATE] No PS1 pattern, trying fallbacks")
 
-            # Get device type for targeted patterns
-            device_type = self._session_shell_types.get(session_key, 'unknown')
-
             common_patterns = [
-                # Network device prompts
+                # Network device prompts (more specific first)
                 r'\([^)]+\)\s*[>#]\s*$',  # (hostname)> or (hostname)#
                 r'[^@\s]+[>#]\s*$',  # hostname> or hostname#
                 r'\[[^@]+@[^\]]+\]\s*[>#$]\s*$',  # [user@host]>
@@ -565,7 +567,7 @@ class SSHSessionManager:
                 r'\[[^@]+@[^\\s\]]+\s+[^\]]*\][$#]\s*$',  # [user@host dir]$ or [user@host dir]#
                 r'[^@]+@[^:]+:[^$#]*[$#]\s*$',  # user@host:path$
                 r'[^@]+@[^\s]+\s+[^$#]*[$#]\s*$',  # user@host path$
-                # Generic prompts
+                # Generic prompts (least specific last)
                 r'[>#\$%]\s*$'  # Generic prompt chars
             ]
 
@@ -573,14 +575,26 @@ class SSHSessionManager:
             if initial_output:
                 clean_output = self._strip_ansi(initial_output)
                 logger.debug(f"[PATTERN_CREATE] Testing fallback patterns against: {repr(clean_output[-100:])}")
+
+                # Score patterns by specificity (longer match = more specific)
+                pattern_scores = []
                 for i, p in enumerate(common_patterns):
                     test_pattern = re.compile(p)
-                    if test_pattern.search(clean_output):
-                        pattern = test_pattern
-                        logger.debug(f"Using common pattern {i}: {p}")
-                        break
+                    match = test_pattern.search(clean_output)
+                    if match:
+                        # Score based on matched text length (more specific = higher score)
+                        score = len(match.group(0))
+                        pattern_scores.append((score, i, test_pattern, p))
+                        logger.debug(f"Pattern {i} matched with score {score}: {p}")
                     else:
                         logger.debug(f"Pattern {i} failed: {p}")
+
+                if pattern_scores:
+                    # Use most specific (highest score) pattern
+                    score, best_idx, pattern, pattern_str = max(pattern_scores)
+                    logger.debug(f"Using most specific pattern {best_idx} (score={score}): {pattern_str}")
+                else:
+                    logger.debug("No patterns matched")
 
             # Final fallback if no pattern matched
             if pattern is None:
@@ -589,6 +603,46 @@ class SSHSessionManager:
 
         logger.debug(f"[PATTERN_CREATE] Final pattern for {session_key}: {pattern.pattern}")
         self._session_prompt_patterns[session_key] = pattern
+        self._prompt_miss_count[session_key] = 0  # Reset miss count
+        return pattern
+
+    def _convert_ps1_to_pattern(self, prompt: str, logger) -> re.Pattern:
+        """Convert PS1 prompt string to regex pattern."""
+        logger.debug(f"[PATTERN_CREATE] Converting PS1: {prompt}")
+
+        # Convert PS1 variables to flexible regex patterns
+        pattern_str = prompt
+        pattern_str = pattern_str.replace('\\u', '[^@\\s]+')  # username
+        pattern_str = pattern_str.replace('\\h', '[^\\s\\]]+')  # hostname
+        pattern_str = pattern_str.replace('\\H', '[^\\s\\]]+')  # full hostname
+        pattern_str = pattern_str.replace('\\W', '[^\\]\\s]*')   # working dir basename
+        pattern_str = pattern_str.replace('\\w', '[^\\]\\s]*')   # full working dir
+        pattern_str = pattern_str.replace('\\$', '[$#]')     # $ or #
+
+        logger.debug(f"[PATTERN_CREATE] After PS1 conversion: {pattern_str}")
+
+        # Now escape special regex chars, but preserve our bracket patterns
+        # First mark our patterns to protect them
+        pattern_str = pattern_str.replace('[^@\\s]+', '___USERNAME___')
+        pattern_str = pattern_str.replace('[^\\s\\]]+', '___HOSTNAME___')
+        pattern_str = pattern_str.replace('[^\\]\\s]*', '___DIRNAME___')
+        pattern_str = pattern_str.replace('[$#]', '___PROMPT___')
+
+        logger.debug(f"[PATTERN_CREATE] After marking: {pattern_str}")
+
+        # Escape everything else
+        pattern_str = re.escape(pattern_str)
+
+        logger.debug(f"[PATTERN_CREATE] After escaping: {pattern_str}")
+
+        # Restore our patterns
+        pattern_str = pattern_str.replace('___USERNAME___', '[^@\\s]+')
+        pattern_str = pattern_str.replace('___HOSTNAME___', '[^\\s\\]]+')
+        pattern_str = pattern_str.replace('___DIRNAME___', '[^\\]\\s]*')
+        pattern_str = pattern_str.replace('___PROMPT___', '[$#]')
+
+        pattern = re.compile(rf"{pattern_str}\s*$")
+        logger.debug(f"Detected PS1 prompt: {prompt} -> pattern: {pattern_str}")
         return pattern
 
     @staticmethod
@@ -611,9 +665,14 @@ class SSHSessionManager:
 
     @staticmethod
     def _extract_prompt_from_output(output: str) -> Optional[str]:
+        """Extract prompt from shell output by finding last line ending with prompt character.
+
+        Uses comprehensive ANSI stripping to handle all escape sequence types.
+        """
         lines = [line.rstrip() for line in output.splitlines() if line.strip()]
         for line in reversed(lines):
-            stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
+            # Use comprehensive ANSI stripping instead of basic CSI-only pattern
+            stripped = SSHSessionManager._strip_ansi(line)
             if stripped and stripped[-1] in ('$', '#', '>', '%'):
                 return stripped.strip()
         return None
@@ -773,7 +832,8 @@ class SSHSessionManager:
             start_time = time.time()
             last_recv_time = start_time
             idle_timeout = 2.0
-            prompt_pattern = self._ensure_prompt_pattern(session_key, client)
+            prompt_pattern = self._ensure_prompt_pattern(session_key, client, shell=shell)
+            consecutive_misses = 0  # Track consecutive prompt detection failures
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
@@ -802,11 +862,28 @@ class SSHSessionManager:
                     if prompt_pattern.search(clean_output):
                         logger.debug(f"Detected command prompt - command complete")
                         logger.debug(f"Clean output last 100 chars: {repr(clean_output[-100:])}")
+                        # Reset miss count on successful match
+                        self._prompt_miss_count[session_key] = 0
+                        consecutive_misses = 0
                         # Remove prompt and trailing whitespace from output
                         output = prompt_pattern.sub('', clean_output).rstrip()
                         return output, "", 0, None
                     else:
                         logger.debug(f"[PROMPT_CHECK] No match found")
+                        consecutive_misses += 1
+
+                        # If we've had too many consecutive misses, regenerate the pattern
+                        if consecutive_misses > 5:
+                            miss_count = self._prompt_miss_count.get(session_key, 0) + 1
+                            self._prompt_miss_count[session_key] = miss_count
+
+                            if miss_count > 3:
+                                logger.warning(f"Prompt pattern failing repeatedly ({miss_count} times), regenerating for {session_key}")
+                                with self._lock:
+                                    self._session_prompt_patterns.pop(session_key, None)
+                                prompt_pattern = self._ensure_prompt_pattern(session_key, client, raw_output, shell)
+                                consecutive_misses = 0
+                                logger.info(f"Regenerated pattern: {prompt_pattern.pattern}")
                 else:
                     # No data available - check if we should timeout from inactivity
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
