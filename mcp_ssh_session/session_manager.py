@@ -471,6 +471,11 @@ class SSHSessionManager:
         This provides the most reliable prompt detection by capturing the exact prompt
         that appears after a known marker, regardless of custom themes or ANSI codes.
 
+        Handles different device types:
+        - Unix/Linux shells: Uses echo command with marker
+        - Network devices: Sends newline and captures response
+        - Generalizes prompts to handle directory changes
+
         Args:
             session_key: Session identifier
             shell: Interactive shell to capture prompt from
@@ -481,73 +486,166 @@ class SSHSessionManager:
         logger = self.logger.getChild('capture_prompt')
 
         try:
-            # Use a unique marker that's unlikely to appear in normal output
-            marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
-
-            # Send marker command - use echo which works on most shells
-            logger.debug(f"[PROMPT_CAPTURE] Sending marker command for {session_key}")
-            shell.send(f'echo "{marker}"\n')
-            time.sleep(0.5)
-
-            # Collect output
+            device_type = self._session_shell_types.get(session_key, 'unknown')
             output = ""
-            start_time = time.time()
-            timeout = 3.0
+            marker = None
 
-            while time.time() - start_time < timeout:
+            # Strategy depends on device type
+            if device_type in ('cisco', 'juniper', 'fortinet', 'arista', 'paloalto',
+                               'checkpoint', 'mikrotik', 'edgeswitch', 'vyos',
+                               'openwrt', 'network_device'):
+                # Network devices: just send newline and capture what comes back
+                logger.debug(f"[PROMPT_CAPTURE] Using newline method for network device {session_key}")
+                shell.send('\n')
+                time.sleep(0.3)
+
                 if shell.recv_ready():
-                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                    output += chunk
+                    output = shell.recv(4096).decode('utf-8', errors='ignore')
+                    logger.debug(f"[PROMPT_CAPTURE] Network device output: {repr(output)}")
+            else:
+                # Unix/Linux shells: try echo with marker
+                marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
+                logger.debug(f"[PROMPT_CAPTURE] Using echo marker method for {session_key}")
+                shell.send(f'echo "{marker}"\n')
+                time.sleep(0.5)
 
-                    # Check if we've received the marker and subsequent prompt
-                    if marker in output:
-                        # Give a bit more time for the prompt to appear
-                        time.sleep(0.3)
-                        if shell.recv_ready():
-                            final_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                            output += final_chunk
-                        break
-                time.sleep(0.1)
+                # Collect output
+                start_time = time.time()
+                timeout = 3.0
 
-            if marker not in output:
-                logger.warning(f"[PROMPT_CAPTURE] Marker not found in output for {session_key}")
-                logger.debug(f"[PROMPT_CAPTURE] Output received: {repr(output)}")
+                while time.time() - start_time < timeout:
+                    if shell.recv_ready():
+                        chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                        output += chunk
+
+                        # Check if we've received the marker and subsequent prompt
+                        if marker in output:
+                            # Give a bit more time for the prompt to appear
+                            time.sleep(0.3)
+                            if shell.recv_ready():
+                                final_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                                output += final_chunk
+                            break
+                    time.sleep(0.1)
+
+                # If marker not found, fall back to newline method
+                if marker and marker not in output:
+                    logger.warning(f"[PROMPT_CAPTURE] Marker not found, trying newline method for {session_key}")
+                    logger.debug(f"[PROMPT_CAPTURE] Output received: {repr(output)}")
+                    # Try simple newline approach
+                    shell.send('\n')
+                    time.sleep(0.3)
+                    if shell.recv_ready():
+                        output = shell.recv(4096).decode('utf-8', errors='ignore')
+                        marker = None  # Disable marker processing
+
+            if not output:
+                logger.warning(f"[PROMPT_CAPTURE] No output received for {session_key}")
                 return None
 
-            # Extract the prompt that appears after the marker
-            # Split by marker and take what comes after
-            parts = output.split(marker)
-            if len(parts) < 2:
-                logger.warning(f"[PROMPT_CAPTURE] Could not split output by marker for {session_key}")
-                return None
-
-            after_marker = parts[-1]
-            logger.debug(f"[PROMPT_CAPTURE] Text after marker: {repr(after_marker)}")
-
-            # Clean ANSI codes
-            clean_after = self._strip_ansi(after_marker)
-            logger.debug(f"[PROMPT_CAPTURE] Cleaned text after marker: {repr(clean_after)}")
-
-            # Extract the prompt - it should be the last non-empty line
-            lines = [line for line in clean_after.split('\n') if line.strip()]
-            if not lines:
-                logger.warning(f"[PROMPT_CAPTURE] No lines found after marker for {session_key}")
-                return None
-
-            # The prompt is typically the last line
-            prompt = lines[-1].strip()
+            # Extract the prompt
+            prompt = None
+            if marker and marker in output:
+                # Extract prompt after marker
+                parts = output.split(marker)
+                if len(parts) >= 2:
+                    after_marker = parts[-1]
+                    logger.debug(f"[PROMPT_CAPTURE] Text after marker: {repr(after_marker)}")
+                    clean_after = self._strip_ansi(after_marker)
+                    lines = [line for line in clean_after.split('\n') if line.strip()]
+                    if lines:
+                        prompt = lines[-1].strip()
+            else:
+                # Extract prompt from simple output (no marker)
+                clean_output = self._strip_ansi(output)
+                logger.debug(f"[PROMPT_CAPTURE] Clean output: {repr(clean_output)}")
+                lines = [line for line in clean_output.split('\n') if line.strip()]
+                if lines:
+                    # Last line is typically the prompt
+                    prompt = lines[-1].strip()
 
             if not prompt:
                 logger.warning(f"[PROMPT_CAPTURE] Empty prompt extracted for {session_key}")
                 return None
 
+            # Generalize the prompt to handle context changes (directory, etc.)
+            generalized_prompt = self._generalize_prompt(prompt, logger)
+
             logger.info(f"[PROMPT_CAPTURE] Successfully captured prompt for {session_key}: {repr(prompt)}")
-            self._session_prompts[session_key] = prompt
-            return prompt
+            if generalized_prompt != prompt:
+                logger.info(f"[PROMPT_CAPTURE] Generalized to: {repr(generalized_prompt)}")
+
+            self._session_prompts[session_key] = generalized_prompt
+            return generalized_prompt
 
         except Exception as exc:
             logger.error(f"[PROMPT_CAPTURE] Failed to capture prompt for {session_key}: {exc}", exc_info=True)
             return None
+
+    def _generalize_prompt(self, prompt: str, logger) -> str:
+        """Generalize a captured prompt to handle context changes.
+
+        Makes prompts flexible for:
+        - Directory changes: [user@host ~/dir]$ -> [user@host *]$
+        - Path changes: user@host:/path$ -> user@host:*$
+
+        Args:
+            prompt: The literal captured prompt
+            logger: Logger instance
+
+        Returns:
+            Generalized prompt pattern (still a literal string with wildcards)
+        """
+        original = prompt
+
+        # Pattern 1: [user@host directory]$ or [user@host directory]#
+        # Generalize: [user@host *]$ or [user@host *]#
+        if '[' in prompt and ']' in prompt and ('@' in prompt or ' ' in prompt):
+            # Replace content between last space/@ and ] with *
+            import re
+            # Match [anything] followed by prompt char
+            match = re.search(r'(\[[^\]]*[@\s][^\]]*)\]([>#\$%])', prompt)
+            if match:
+                # Find the last space or path separator in the bracket
+                bracket_content = match.group(1)
+                prompt_char = match.group(2)
+                # Replace everything after last space with *
+                if ' ' in bracket_content:
+                    parts = bracket_content.rsplit(' ', 1)
+                    generalized = parts[0] + ' *]' + prompt_char
+                    logger.debug(f"[GENERALIZE] Bracketed space: {original} -> {generalized}")
+                    return generalized
+
+        # Pattern 2: user@host:/path$ or user@host:/path#
+        # Generalize: user@host:*$ or user@host:*#
+        if ':' in prompt and '@' in prompt:
+            # Replace path after : with *
+            parts = prompt.rsplit(':', 1)
+            if len(parts) == 2:
+                # Keep the prompt char at the end
+                prompt_char_match = re.search(r'([>#\$%]\s*)$', parts[1])
+                if prompt_char_match:
+                    prompt_char = prompt_char_match.group(1)
+                    generalized = parts[0] + ':*' + prompt_char
+                    logger.debug(f"[GENERALIZE] Path colon: {original} -> {generalized}")
+                    return generalized
+
+        # Pattern 3: user@host directory$ or user@host directory#
+        # Generalize: user@host *$ or user@host *#
+        if '@' in prompt and ' ' in prompt:
+            match = re.search(r'(@[^\s]+\s+)(.+)([>#\$%]\s*)$', prompt)
+            if match:
+                prefix = match.group(1)
+                prompt_char = match.group(3)
+                # Extract user part
+                user_part = prompt.split('@')[0]
+                generalized = user_part + prefix + '*' + prompt_char
+                logger.debug(f"[GENERALIZE] Space separated: {original} -> {generalized}")
+                return generalized
+
+        # No generalization needed
+        logger.debug(f"[GENERALIZE] No changes needed: {original}")
+        return prompt
 
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
         """Legacy method - now handled by _build_device_profile."""
@@ -883,19 +981,35 @@ class SSHSessionManager:
         """
         logger = self.logger.getChild('prompt_check')
 
-        # Strategy 1: Check for captured literal prompt (most reliable)
+        # Strategy 1: Check for captured literal/generalized prompt (most reliable)
         if session_key in self._session_prompts:
             literal_prompt = self._session_prompts[session_key]
-            logger.debug(f"[PROMPT_CHECK] Checking for literal prompt: {repr(literal_prompt)}")
+            logger.debug(f"[PROMPT_CHECK] Checking for prompt: {repr(literal_prompt)}")
 
-            # Check if output ends with the literal prompt
-            if clean_output.rstrip().endswith(literal_prompt):
-                logger.debug(f"[PROMPT_CHECK] Found literal prompt match!")
-                # Remove the prompt from output
-                output = clean_output.rstrip()
-                if output.endswith(literal_prompt):
-                    output = output[:-len(literal_prompt)].rstrip()
-                return True, output
+            # Check if prompt contains wildcards (generalized)
+            if '*' in literal_prompt:
+                # Convert to pattern for wildcard matching
+                # Escape special regex chars except *
+                pattern_str = re.escape(literal_prompt).replace(r'\*', '.*?')
+                # Ensure it matches at end of output
+                pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
+                logger.debug(f"[PROMPT_CHECK] Using wildcard pattern: {pattern.pattern}")
+
+                match = pattern.search(clean_output.rstrip())
+                if match:
+                    logger.debug(f"[PROMPT_CHECK] Found wildcard prompt match!")
+                    # Remove the matched prompt from output
+                    output = clean_output[:match.start()].rstrip()
+                    return True, output
+            else:
+                # Exact literal match
+                if clean_output.rstrip().endswith(literal_prompt):
+                    logger.debug(f"[PROMPT_CHECK] Found literal prompt match!")
+                    # Remove the prompt from output
+                    output = clean_output.rstrip()
+                    if output.endswith(literal_prompt):
+                        output = output[:-len(literal_prompt)].rstrip()
+                    return True, output
 
         # Strategy 2: Fall back to pattern matching
         if session_key in self._session_prompt_patterns:
@@ -945,6 +1059,46 @@ class SSHSessionManager:
 
         return None
 
+    def _is_context_changing_command(self, command: str) -> bool:
+        """Detect if a command is likely to change the shell context/prompt.
+
+        Commands that change the shell context include:
+        - sudo -i, sudo -s, sudo su (root shell)
+        - su, su - (switch user)
+        - ssh (nested SSH)
+        - docker exec -it, kubectl exec -it (container shells)
+        - screen, tmux (terminal multiplexers)
+        - bash, sh, zsh, fish (spawning new shell)
+
+        Args:
+            command: The command to check
+
+        Returns:
+            True if command likely changes shell context
+        """
+        # Extract base command (first word)
+        cmd_lower = command.strip().lower()
+        base_cmd = cmd_lower.split()[0] if cmd_lower else ''
+
+        # Check for context-changing patterns
+        context_changers = [
+            r'^sudo\s+(-i|su|-s)',  # sudo -i, sudo su, sudo -s
+            r'^su\b',                # su, su -, su user
+            r'^ssh\b',               # ssh to another host
+            r'^docker\s+exec.*-it',  # docker exec -it
+            r'^kubectl\s+exec.*-it', # kubectl exec -it
+            r'^podman\s+exec.*-it',  # podman exec -it
+            r'^screen\b',            # screen
+            r'^tmux\b',              # tmux
+            r'^(bash|sh|zsh|fish|ksh|csh|tcsh)\s*$',  # spawning new shell
+        ]
+
+        for pattern in context_changers:
+            if re.search(pattern, cmd_lower):
+                return True
+
+        return False
+
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
                                            timeout: int, session_key: str) -> tuple[str, str, int, Optional[str]]:
         """Execute command with natural completion detection and interactive prompt detection.
@@ -953,6 +1107,11 @@ class SSHSessionManager:
         - awaiting_input_reason is None if complete, or a string describing what input is needed
         """
         logger = self.logger.getChild('standard_command')
+
+        # Check if this command will change the shell context
+        context_changing = self._is_context_changing_command(command)
+        if context_changing:
+            logger.info(f"Detected context-changing command: {command}")
 
         try:
             shell = self._get_or_create_shell(session_key, client)
@@ -1003,6 +1162,14 @@ class SSHSessionManager:
                         # Reset miss count on successful match
                         self._prompt_miss_count[session_key] = 0
                         consecutive_misses = 0
+
+                        # If this was a context-changing command, recapture the prompt
+                        if context_changing:
+                            logger.info(f"Recapturing prompt after context-changing command")
+                            with self._lock:
+                                self._session_prompts.pop(session_key, None)
+                            self._capture_prompt(session_key, shell)
+
                         return cleaned_output, "", 0, None
                     else:
                         logger.debug(f"[PROMPT_CHECK] No prompt match found")
@@ -1040,6 +1207,14 @@ class SSHSessionManager:
                         is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
                         if is_complete:
                             logger.debug("Prompt found in cleaned output during idle timeout")
+
+                        # If this was a context-changing command, recapture the prompt
+                        if context_changing and is_complete:
+                            logger.info(f"Recapturing prompt after context-changing command (idle timeout)")
+                            with self._lock:
+                                self._session_prompts.pop(session_key, None)
+                            self._capture_prompt(session_key, shell)
+
                         return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
