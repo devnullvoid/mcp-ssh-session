@@ -597,6 +597,7 @@ class SSHSessionManager:
             Generalized prompt pattern (still a literal string with wildcards)
         """
         original = prompt
+        logger.debug(f"[GENERALIZE] Starting with prompt: {repr(prompt)}")
 
         # Pattern 1: [user@host directory]$ or [user@host directory]#
         # Generalize: [user@host *]$ or [user@host *]#
@@ -616,7 +617,7 @@ class SSHSessionManager:
                     logger.debug(f"[GENERALIZE] Bracketed space: {original} -> {generalized}")
                     return generalized
 
-        # Pattern 2: user@host:/path$ or user@host:/path#
+        # Pattern 2: user@host:/path$ or user@host:~$ or user@host:~/path$
         # Generalize: user@host:*$ or user@host:*#
         if ':' in prompt and '@' in prompt:
             # Replace path after : with *
@@ -629,6 +630,15 @@ class SSHSessionManager:
                     generalized = parts[0] + ':*' + prompt_char
                     logger.debug(f"[GENERALIZE] Path colon: {original} -> {generalized}")
                     return generalized
+                # If no prompt char found but there's content after colon, still generalize
+                elif parts[1].strip():
+                    # Assume last character is prompt char
+                    content = parts[1].rstrip()
+                    if content and content[-1] in '>#$%':
+                        prompt_char = content[-1]
+                        generalized = parts[0] + ':*' + prompt_char
+                        logger.debug(f"[GENERALIZE] Path colon (inferred): {original} -> {generalized}")
+                        return generalized
 
         # Pattern 3: user@host directory$ or user@host directory#
         # Generalize: user@host *$ or user@host *#
@@ -641,6 +651,16 @@ class SSHSessionManager:
                 user_part = prompt.split('@')[0]
                 generalized = user_part + prefix + '*' + prompt_char
                 logger.debug(f"[GENERALIZE] Space separated: {original} -> {generalized}")
+                return generalized
+
+        # Pattern 4: Simple prompts with just directory before prompt char
+        # ~/dir$ -> *$ or /path$ -> *$
+        if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
+            match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
+            if match:
+                prompt_char = match.group(2)
+                generalized = '*' + prompt_char
+                logger.debug(f"[GENERALIZE] Simple path: {original} -> {generalized}")
                 return generalized
 
         # No generalization needed

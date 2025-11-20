@@ -1,8 +1,5 @@
 # Justfile for mcp-ssh-session project
 
-# Phony targets, so that a file named 'install', 'test', etc. won't conflict.
-.PHONY: install test run lint clean
-
 # Install project dependencies
 install:
     @echo "Installing dependencies..."
