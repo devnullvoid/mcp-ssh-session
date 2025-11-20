@@ -42,6 +42,7 @@ class SSHSessionManager:
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
         self._session_shell_types: Dict[str, str] = {}
         self._session_prompt_patterns: Dict[str, re.Pattern] = {}
+        self._session_prompts: Dict[str, str] = {}  # Store literal captured prompts
         self._prompt_miss_count: Dict[str, int] = {}  # Track failed prompt matches for regeneration
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
@@ -295,6 +296,7 @@ class SSHSessionManager:
             del self._sessions[session_key]
         self._session_shell_types.pop(session_key, None)
         self._session_prompt_patterns.pop(session_key, None)
+        self._session_prompts.pop(session_key, None)
         if session_key in self._session_shell_types:
             del self._session_shell_types[session_key]
 
@@ -330,6 +332,7 @@ class SSHSessionManager:
             self._enable_mode.clear()
             self._session_shell_types.clear()
             self._session_prompt_patterns.clear()
+            self._session_prompts.clear()
             self._session_shell_types.clear()
 
         logger.info("All sessions closed.")
@@ -379,7 +382,9 @@ class SSHSessionManager:
                     client_ref = self._sessions.get(session_key)
                     if client_ref:
                         self._ensure_shell_type(session_key, client_ref)
-                        self._ensure_prompt_pattern(session_key, client_ref, shell=shell)
+                        # Recapture prompt if not available
+                        if session_key not in self._session_prompts:
+                            self._capture_prompt(session_key, shell)
                     return shell
             except Exception as exc:
                 logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {exc}. Recreating.")
@@ -405,6 +410,10 @@ class SSHSessionManager:
         # Build device profile from shell output instead of exec_command
         logger.debug(f"[SHELL_DEBUG] Building device profile from shell output")
         self._build_device_profile(session_key, initial_output)
+
+        # Capture the actual prompt for this session
+        logger.debug(f"[SHELL_DEBUG] Capturing prompt for {session_key}")
+        self._capture_prompt(session_key, shell)
 
         logger.info(f"[SHELL_READY] New shell for {session_key} is ready.")
         return shell
@@ -455,6 +464,90 @@ class SSHSessionManager:
         self._ensure_prompt_pattern(session_key, None, initial_output)
 
         logger.debug(f"[PROFILE] Device profile complete for {session_key}: type={device_type}")
+
+    def _capture_prompt(self, session_key: str, shell: Any) -> Optional[str]:
+        """Capture the actual prompt string for this session by sending a marker command.
+
+        This provides the most reliable prompt detection by capturing the exact prompt
+        that appears after a known marker, regardless of custom themes or ANSI codes.
+
+        Args:
+            session_key: Session identifier
+            shell: Interactive shell to capture prompt from
+
+        Returns:
+            Captured prompt string (ANSI-stripped), or None if capture failed
+        """
+        logger = self.logger.getChild('capture_prompt')
+
+        try:
+            # Use a unique marker that's unlikely to appear in normal output
+            marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
+
+            # Send marker command - use echo which works on most shells
+            logger.debug(f"[PROMPT_CAPTURE] Sending marker command for {session_key}")
+            shell.send(f'echo "{marker}"\n')
+            time.sleep(0.5)
+
+            # Collect output
+            output = ""
+            start_time = time.time()
+            timeout = 3.0
+
+            while time.time() - start_time < timeout:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    output += chunk
+
+                    # Check if we've received the marker and subsequent prompt
+                    if marker in output:
+                        # Give a bit more time for the prompt to appear
+                        time.sleep(0.3)
+                        if shell.recv_ready():
+                            final_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                            output += final_chunk
+                        break
+                time.sleep(0.1)
+
+            if marker not in output:
+                logger.warning(f"[PROMPT_CAPTURE] Marker not found in output for {session_key}")
+                logger.debug(f"[PROMPT_CAPTURE] Output received: {repr(output)}")
+                return None
+
+            # Extract the prompt that appears after the marker
+            # Split by marker and take what comes after
+            parts = output.split(marker)
+            if len(parts) < 2:
+                logger.warning(f"[PROMPT_CAPTURE] Could not split output by marker for {session_key}")
+                return None
+
+            after_marker = parts[-1]
+            logger.debug(f"[PROMPT_CAPTURE] Text after marker: {repr(after_marker)}")
+
+            # Clean ANSI codes
+            clean_after = self._strip_ansi(after_marker)
+            logger.debug(f"[PROMPT_CAPTURE] Cleaned text after marker: {repr(clean_after)}")
+
+            # Extract the prompt - it should be the last non-empty line
+            lines = [line for line in clean_after.split('\n') if line.strip()]
+            if not lines:
+                logger.warning(f"[PROMPT_CAPTURE] No lines found after marker for {session_key}")
+                return None
+
+            # The prompt is typically the last line
+            prompt = lines[-1].strip()
+
+            if not prompt:
+                logger.warning(f"[PROMPT_CAPTURE] Empty prompt extracted for {session_key}")
+                return None
+
+            logger.info(f"[PROMPT_CAPTURE] Successfully captured prompt for {session_key}: {repr(prompt)}")
+            self._session_prompts[session_key] = prompt
+            return prompt
+
+        except Exception as exc:
+            logger.error(f"[PROMPT_CAPTURE] Failed to capture prompt for {session_key}: {exc}", exc_info=True)
+            return None
 
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
         """Legacy method - now handled by _build_device_profile."""
@@ -777,6 +870,47 @@ class SSHSessionManager:
             client, command, sudo_password, timeout
         )
 
+    def _check_prompt_completion(self, session_key: str, raw_output: str, clean_output: str) -> tuple[bool, str]:
+        """Check if output indicates command completion by detecting the prompt.
+
+        Args:
+            session_key: Session identifier
+            raw_output: Raw output with ANSI codes
+            clean_output: ANSI-stripped output
+
+        Returns:
+            Tuple of (is_complete, cleaned_output_without_prompt)
+        """
+        logger = self.logger.getChild('prompt_check')
+
+        # Strategy 1: Check for captured literal prompt (most reliable)
+        if session_key in self._session_prompts:
+            literal_prompt = self._session_prompts[session_key]
+            logger.debug(f"[PROMPT_CHECK] Checking for literal prompt: {repr(literal_prompt)}")
+
+            # Check if output ends with the literal prompt
+            if clean_output.rstrip().endswith(literal_prompt):
+                logger.debug(f"[PROMPT_CHECK] Found literal prompt match!")
+                # Remove the prompt from output
+                output = clean_output.rstrip()
+                if output.endswith(literal_prompt):
+                    output = output[:-len(literal_prompt)].rstrip()
+                return True, output
+
+        # Strategy 2: Fall back to pattern matching
+        if session_key in self._session_prompt_patterns:
+            prompt_pattern = self._session_prompt_patterns[session_key]
+            logger.debug(f"[PROMPT_CHECK] Checking pattern: {prompt_pattern.pattern}")
+
+            if prompt_pattern.search(clean_output):
+                logger.debug(f"[PROMPT_CHECK] Pattern matched!")
+                output = prompt_pattern.sub('', clean_output).rstrip()
+                return True, output
+
+        logger.debug(f"[PROMPT_CHECK] No prompt match found")
+        logger.debug(f"[PROMPT_CHECK] Clean output last 100 chars: {repr(clean_output[-100:])}")
+        return False, clean_output
+
     def _detect_awaiting_input(self, output: str) -> Optional[str]:
         """Detect if command is waiting for user input.
 
@@ -800,7 +934,7 @@ class SSHSessionManager:
         if re.search(r'\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$',
                      output, re.IGNORECASE | re.MULTILINE):
             return "yes_no"
-            
+
         # Press any key / continue
         if re.search(r'press any key|press enter|to continue', output, re.IGNORECASE | re.MULTILINE):
             return "press_key"
@@ -836,7 +970,8 @@ class SSHSessionManager:
             start_time = time.time()
             last_recv_time = start_time
             idle_timeout = 2.0
-            prompt_pattern = self._ensure_prompt_pattern(session_key, client, shell=shell)
+            # Ensure prompt pattern exists as fallback
+            self._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
             while time.time() - start_time < timeout:
@@ -856,44 +991,44 @@ class SSHSessionManager:
                         logger.info(f"Detected interactive prompt: {awaiting}")
                         return raw_output, "", 0, awaiting
 
-                    # Check for command completion (prompt at end of output)
-                    # Strip ANSI codes before checking for prompt
+                    # Check for command completion using captured prompt or pattern
                     clean_output = self._strip_ansi(raw_output)
                     logger.debug(f"[PROMPT_CHECK] Raw output last 200 chars: {repr(raw_output[-200:])}")
                     logger.debug(f"[PROMPT_CHECK] Clean output last 200 chars: {repr(clean_output[-200:])}")
-                    logger.debug(f"[PROMPT_CHECK] Pattern: {prompt_pattern.pattern}")
 
-                    if prompt_pattern.search(clean_output):
-                        logger.debug(f"Detected command prompt - command complete")
-                        logger.debug(f"Clean output last 100 chars: {repr(clean_output[-100:])}")
+                    is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+
+                    if is_complete:
+                        logger.debug(f"Command complete - prompt detected")
                         # Reset miss count on successful match
                         self._prompt_miss_count[session_key] = 0
                         consecutive_misses = 0
-                        # Remove prompt and trailing whitespace from output
-                        output = prompt_pattern.sub('', clean_output).rstrip()
-                        return output, "", 0, None
+                        return cleaned_output, "", 0, None
                     else:
-                        logger.debug(f"[PROMPT_CHECK] No match found")
+                        logger.debug(f"[PROMPT_CHECK] No prompt match found")
                         consecutive_misses += 1
 
-                        # If we've had too many consecutive misses, regenerate the pattern
-                        if consecutive_misses > 5:
+                        # If we've had too many consecutive misses, try recapturing the prompt
+                        if consecutive_misses > 10:
                             miss_count = self._prompt_miss_count.get(session_key, 0) + 1
                             self._prompt_miss_count[session_key] = miss_count
 
                             if miss_count > 3:
-                                logger.warning(f"Prompt pattern failing repeatedly ({miss_count} times), regenerating for {session_key}")
+                                logger.warning(f"Prompt detection failing repeatedly ({miss_count} times), recapturing for {session_key}")
                                 with self._lock:
+                                    self._session_prompts.pop(session_key, None)
                                     self._session_prompt_patterns.pop(session_key, None)
-                                prompt_pattern = self._ensure_prompt_pattern(session_key, client, raw_output, shell)
+                                # Try to recapture prompt
+                                self._capture_prompt(session_key, shell)
+                                self._ensure_prompt_pattern(session_key, client, raw_output, shell)
                                 consecutive_misses = 0
-                                logger.info(f"Regenerated pattern: {prompt_pattern.pattern}")
+                                logger.info(f"Recaptured prompt and regenerated pattern")
                 else:
                     # No data available - check if we should timeout from inactivity
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
                         logger.debug(f"Idle timeout after {idle_timeout}s - cleaning and returning output")
-                        output = self._strip_ansi(raw_output).rstrip()
-                        logger.debug(f"Cleaned output last 100 chars: {repr(output[-100:])}")
+                        clean_output = self._strip_ansi(raw_output)
+                        logger.debug(f"Cleaned output last 100 chars: {repr(clean_output[-100:])}")
 
                         # Check for interactive prompts BEFORE checking for completion
                         awaiting = self._detect_awaiting_input(raw_output)
@@ -902,10 +1037,10 @@ class SSHSessionManager:
                             return raw_output, "", 0, awaiting
 
                         # Try one more prompt check on cleaned output
-                        if prompt_pattern.search(output):
+                        is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                        if is_complete:
                             logger.debug("Prompt found in cleaned output during idle timeout")
-                            output = prompt_pattern.sub('', output).rstrip()
-                        return output, "", 0, None
+                        return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")
