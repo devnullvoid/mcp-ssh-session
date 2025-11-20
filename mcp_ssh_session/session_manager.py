@@ -60,6 +60,10 @@ class SSHSessionManager:
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False  # Don't propagate to root logger
 
+        # Remove existing handlers to prevent duplicates when multiple instances are created
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+
         # Only add file handler (no StreamHandler to avoid MCP notifications)
         file_handler = logging.FileHandler(str(log_file))
         file_handler.setFormatter(logging.Formatter(
@@ -603,7 +607,6 @@ class SSHSessionManager:
         # Generalize: [user@host *]$ or [user@host *]#
         if '[' in prompt and ']' in prompt and ('@' in prompt or ' ' in prompt):
             # Replace content between last space/@ and ] with *
-            import re
             # Match [anything] followed by prompt char
             match = re.search(r'(\[[^\]]*[@\s][^\]]*)\]([>#\$%])', prompt)
             if match:
