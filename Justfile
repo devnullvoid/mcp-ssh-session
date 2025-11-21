@@ -15,47 +15,53 @@ install:
 #   just test host=router user=admin password=cisco enable_password=enable  # Network device tests
 test host="" user="" password="" keyfile="" port="22" sudo_password="" enable_password="":
     #!/usr/bin/env bash
+    set -euo pipefail
     echo "Running tests..."
 
-    # Build environment variables based on provided parameters
-    ENV_VARS=""
-
+    # Export environment variables based on provided parameters
     if [ -n "{{host}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_HOST={{host}}"
+        export SSH_TEST_HOST="{{host}}"
+        echo "  SSH_TEST_HOST={{host}}"
     fi
 
     if [ -n "{{user}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_USER={{user}}"
+        export SSH_TEST_USER="{{user}}"
+        echo "  SSH_TEST_USER={{user}}"
     fi
 
     if [ -n "{{password}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_PASSWORD={{password}}"
+        export SSH_TEST_PASSWORD="{{password}}"
+        echo "  SSH_TEST_PASSWORD=***"
     fi
 
     if [ -n "{{keyfile}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_KEY_FILE={{keyfile}}"
+        export SSH_TEST_KEY_FILE="{{keyfile}}"
+        echo "  SSH_TEST_KEY_FILE={{keyfile}}"
     fi
 
     if [ -n "{{port}}" ] && [ "{{port}}" != "22" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_PORT={{port}}"
+        export SSH_TEST_PORT="{{port}}"
+        echo "  SSH_TEST_PORT={{port}}"
     fi
 
     if [ -n "{{sudo_password}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_SUDO_PASSWORD={{sudo_password}}"
+        export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
+        echo "  SSH_TEST_SUDO_PASSWORD=***"
     fi
 
     if [ -n "{{enable_password}}" ]; then
-        ENV_VARS="${ENV_VARS} SSH_TEST_ENABLE_PASSWORD={{enable_password}}"
+        export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
+        echo "  SSH_TEST_ENABLE_PASSWORD=***"
     fi
 
-    # Run pytest with the built environment
-    if [ -n "${ENV_VARS}" ]; then
-        echo "Running with environment: ${ENV_VARS}"
-        env ${ENV_VARS} uv run pytest tests/ -v
+    # Run pytest
+    if [ -n "{{host}}" ] || [ -n "{{user}}" ]; then
+        echo "Running integration tests..."
     else
-        echo "Running without integration tests (no SSH parameters provided)"
-        uv run pytest tests/ -v
+        echo "Running tests (integration tests will be skipped - no host specified)"
     fi
+
+    uv run pytest tests/ -v
 
 # Run the MCP SSH Session server
 run:
