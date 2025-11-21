@@ -17,42 +17,57 @@ test host="" user="" password="" keyfile="" port="22" sudo_password="" enable_pa
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Running tests..."
+    echo ""
+    echo "Parameters received:"
+    echo "  host='{{host}}'"
+    echo "  user='{{user}}'"
+    echo "  port='{{port}}'"
+    echo ""
+
+    # Clear any existing SSH_TEST_* variables to avoid conflicts
+    unset SSH_TEST_HOST SSH_TEST_USER SSH_TEST_PASSWORD SSH_TEST_KEY_FILE SSH_TEST_PORT SSH_TEST_SUDO_PASSWORD SSH_TEST_ENABLE_PASSWORD 2>/dev/null || true
 
     # Export environment variables based on provided parameters
     if [ -n "{{host}}" ]; then
         export SSH_TEST_HOST="{{host}}"
-        echo "  SSH_TEST_HOST={{host}}"
+        echo "Setting: SSH_TEST_HOST='{{host}}'"
     fi
 
     if [ -n "{{user}}" ]; then
         export SSH_TEST_USER="{{user}}"
-        echo "  SSH_TEST_USER={{user}}"
+        echo "Setting: SSH_TEST_USER='{{user}}'"
     fi
 
     if [ -n "{{password}}" ]; then
         export SSH_TEST_PASSWORD="{{password}}"
-        echo "  SSH_TEST_PASSWORD=***"
+        echo "Setting: SSH_TEST_PASSWORD='***'"
     fi
 
     if [ -n "{{keyfile}}" ]; then
         export SSH_TEST_KEY_FILE="{{keyfile}}"
-        echo "  SSH_TEST_KEY_FILE={{keyfile}}"
+        echo "Setting: SSH_TEST_KEY_FILE='{{keyfile}}'"
     fi
 
     if [ -n "{{port}}" ] && [ "{{port}}" != "22" ]; then
         export SSH_TEST_PORT="{{port}}"
-        echo "  SSH_TEST_PORT={{port}}"
+        echo "Setting: SSH_TEST_PORT='{{port}}'"
     fi
 
     if [ -n "{{sudo_password}}" ]; then
         export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
-        echo "  SSH_TEST_SUDO_PASSWORD=***"
+        echo "Setting: SSH_TEST_SUDO_PASSWORD='***'"
     fi
 
     if [ -n "{{enable_password}}" ]; then
         export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
-        echo "  SSH_TEST_ENABLE_PASSWORD=***"
+        echo "Setting: SSH_TEST_ENABLE_PASSWORD='***'"
     fi
+
+    echo ""
+    echo "Environment variables before pytest:"
+    echo "  SSH_TEST_HOST='${SSH_TEST_HOST:-}'"
+    echo "  SSH_TEST_USER='${SSH_TEST_USER:-}'"
+    echo ""
 
     # Run pytest
     if [ -n "{{host}}" ] || [ -n "{{user}}" ]; then
@@ -60,8 +75,9 @@ test host="" user="" password="" keyfile="" port="22" sudo_password="" enable_pa
     else
         echo "Running tests (integration tests will be skipped - no host specified)"
     fi
+    echo ""
 
-    uv run pytest tests/ -v
+    uv run pytest tests/ -v -s
 
 # Run the MCP SSH Session server
 run:

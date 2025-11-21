@@ -25,7 +25,9 @@ class TestSSHIntegration:
         password = os.environ.get("SSH_TEST_PASSWORD")
         key_filename = os.environ.get("SSH_TEST_KEY_FILE")
         port = int(os.environ.get("SSH_TEST_PORT", "22"))
-        
+
+        print(f"\n[DEBUG] Test config - host: {repr(host)}, username: {repr(username)}, port: {port}")
+
         return {
             "host": host,
             "username": username,
