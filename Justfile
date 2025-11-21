@@ -18,7 +18,7 @@ test host="" user="" password="" keyfile="" port="22" sudo_password="" enable_pa
     set -euo pipefail
     echo "Running tests..."
     echo ""
-    echo "Parameters received:"
+    echo "Raw parameters received:"
     echo "  host='{{host}}'"
     echo "  user='{{user}}'"
     echo "  port='{{port}}'"
@@ -27,50 +27,81 @@ test host="" user="" password="" keyfile="" port="22" sudo_password="" enable_pa
     # Clear any existing SSH_TEST_* variables to avoid conflicts
     unset SSH_TEST_HOST SSH_TEST_USER SSH_TEST_PASSWORD SSH_TEST_KEY_FILE SSH_TEST_PORT SSH_TEST_SUDO_PASSWORD SSH_TEST_ENABLE_PASSWORD 2>/dev/null || true
 
+    # Strip any "key=" prefix from values (workaround for shell/env issues)
+    # This handles cases where parameters come in as "host=value" instead of just "value"
+    HOST_VALUE="{{host}}"
+    HOST_VALUE="${HOST_VALUE#host=}"
+
+    USER_VALUE="{{user}}"
+    USER_VALUE="${USER_VALUE#user=}"
+
+    PASSWORD_VALUE="{{password}}"
+    PASSWORD_VALUE="${PASSWORD_VALUE#password=}"
+
+    KEYFILE_VALUE="{{keyfile}}"
+    KEYFILE_VALUE="${KEYFILE_VALUE#keyfile=}"
+    KEYFILE_VALUE="${KEYFILE_VALUE#key_filename=}"
+
+    PORT_VALUE="{{port}}"
+    PORT_VALUE="${PORT_VALUE#port=}"
+
+    SUDO_PASSWORD_VALUE="{{sudo_password}}"
+    SUDO_PASSWORD_VALUE="${SUDO_PASSWORD_VALUE#sudo_password=}"
+
+    ENABLE_PASSWORD_VALUE="{{enable_password}}"
+    ENABLE_PASSWORD_VALUE="${ENABLE_PASSWORD_VALUE#enable_password=}"
+
+    echo "Cleaned parameters:"
+    echo "  host='$HOST_VALUE'"
+    echo "  user='$USER_VALUE'"
+    echo "  port='$PORT_VALUE'"
+    echo ""
+
     # Export environment variables based on provided parameters
-    if [ -n "{{host}}" ]; then
-        export SSH_TEST_HOST="{{host}}"
-        echo "Setting: SSH_TEST_HOST='{{host}}'"
+    if [ -n "$HOST_VALUE" ]; then
+        export SSH_TEST_HOST="$HOST_VALUE"
+        echo "Setting: SSH_TEST_HOST='$HOST_VALUE'"
     fi
 
-    if [ -n "{{user}}" ]; then
-        export SSH_TEST_USER="{{user}}"
-        echo "Setting: SSH_TEST_USER='{{user}}'"
+    if [ -n "$USER_VALUE" ]; then
+        export SSH_TEST_USER="$USER_VALUE"
+        echo "Setting: SSH_TEST_USER='$USER_VALUE'"
     fi
 
-    if [ -n "{{password}}" ]; then
-        export SSH_TEST_PASSWORD="{{password}}"
+    if [ -n "$PASSWORD_VALUE" ]; then
+        export SSH_TEST_PASSWORD="$PASSWORD_VALUE"
         echo "Setting: SSH_TEST_PASSWORD='***'"
     fi
 
-    if [ -n "{{keyfile}}" ]; then
-        export SSH_TEST_KEY_FILE="{{keyfile}}"
-        echo "Setting: SSH_TEST_KEY_FILE='{{keyfile}}'"
+    if [ -n "$KEYFILE_VALUE" ]; then
+        export SSH_TEST_KEY_FILE="$KEYFILE_VALUE"
+        echo "Setting: SSH_TEST_KEY_FILE='$KEYFILE_VALUE'"
     fi
 
-    if [ -n "{{port}}" ] && [ "{{port}}" != "22" ]; then
-        export SSH_TEST_PORT="{{port}}"
-        echo "Setting: SSH_TEST_PORT='{{port}}'"
+    if [ -n "$PORT_VALUE" ] && [ "$PORT_VALUE" != "22" ]; then
+        export SSH_TEST_PORT="$PORT_VALUE"
+        echo "Setting: SSH_TEST_PORT='$PORT_VALUE'"
     fi
 
-    if [ -n "{{sudo_password}}" ]; then
-        export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
+    if [ -n "$SUDO_PASSWORD_VALUE" ]; then
+        export SSH_TEST_SUDO_PASSWORD="$SUDO_PASSWORD_VALUE"
         echo "Setting: SSH_TEST_SUDO_PASSWORD='***'"
     fi
 
-    if [ -n "{{enable_password}}" ]; then
-        export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
+    if [ -n "$ENABLE_PASSWORD_VALUE" ]; then
+        export SSH_TEST_ENABLE_PASSWORD="$ENABLE_PASSWORD_VALUE"
         echo "Setting: SSH_TEST_ENABLE_PASSWORD='***'"
     fi
 
     echo ""
-    echo "Environment variables before pytest:"
+    echo "Final environment variables:"
     echo "  SSH_TEST_HOST='${SSH_TEST_HOST:-}'"
     echo "  SSH_TEST_USER='${SSH_TEST_USER:-}'"
+    echo "  SSH_TEST_PORT='${SSH_TEST_PORT:-22}'"
     echo ""
 
     # Run pytest
-    if [ -n "{{host}}" ] || [ -n "{{user}}" ]; then
+    if [ -n "$HOST_VALUE" ] || [ -n "$USER_VALUE" ]; then
         echo "Running integration tests..."
     else
         echo "Running tests (integration tests will be skipped - no host specified)"
