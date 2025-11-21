@@ -42,7 +42,7 @@ class SSHSessionManager:
         self._session_shells: Dict[str, Any] = {}  # Track persistent shells for stateful sessions
         self._session_shell_types: Dict[str, str] = {}
         self._session_prompt_patterns: Dict[str, re.Pattern] = {}
-        self._session_prompts: Dict[str, str] = {}
+        self._session_prompts: Dict[str, str] = {}  # Store literal captured prompts
         self._prompt_miss_count: Dict[str, int] = {}  # Track failed prompt matches for regeneration
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
@@ -59,6 +59,10 @@ class SSHSessionManager:
         self.logger = logging.getLogger('ssh_session')
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False  # Don't propagate to root logger
+
+        # Remove existing handlers to prevent duplicates when multiple instances are created
+        if self.logger.handlers:
+            self.logger.handlers.clear()
 
         # Only add file handler (no StreamHandler to avoid MCP notifications)
         file_handler = logging.FileHandler(str(log_file))
@@ -296,6 +300,7 @@ class SSHSessionManager:
             del self._sessions[session_key]
         self._session_shell_types.pop(session_key, None)
         self._session_prompt_patterns.pop(session_key, None)
+        self._session_prompts.pop(session_key, None)
         if session_key in self._session_shell_types:
             del self._session_shell_types[session_key]
 
@@ -331,6 +336,7 @@ class SSHSessionManager:
             self._enable_mode.clear()
             self._session_shell_types.clear()
             self._session_prompt_patterns.clear()
+            self._session_prompts.clear()
             self._session_shell_types.clear()
 
         logger.info("All sessions closed.")
@@ -380,7 +386,9 @@ class SSHSessionManager:
                     client_ref = self._sessions.get(session_key)
                     if client_ref:
                         self._ensure_shell_type(session_key, client_ref)
-                        self._ensure_prompt_pattern(session_key, client_ref, shell=shell)
+                        # Recapture prompt if not available
+                        if session_key not in self._session_prompts:
+                            self._capture_prompt(session_key, shell)
                     return shell
             except Exception as exc:
                 logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {exc}. Recreating.")
@@ -406,6 +414,10 @@ class SSHSessionManager:
         # Build device profile from shell output instead of exec_command
         logger.debug(f"[SHELL_DEBUG] Building device profile from shell output")
         self._build_device_profile(session_key, initial_output)
+
+        # Capture the actual prompt for this session
+        logger.debug(f"[SHELL_DEBUG] Capturing prompt for {session_key}")
+        self._capture_prompt(session_key, shell)
 
         logger.info(f"[SHELL_READY] New shell for {session_key} is ready.")
         return shell
@@ -589,6 +601,7 @@ class SSHSessionManager:
             Generalized prompt pattern (still a literal string with wildcards)
         """
         original = prompt
+        logger.debug(f"[GENERALIZE] Starting with prompt: {repr(prompt)}")
 
         # Pattern 1: [user@host directory]$ or [user@host directory]#
         # Generalize: [user@host *]$ or [user@host *]#
@@ -607,7 +620,7 @@ class SSHSessionManager:
                     logger.debug(f"[GENERALIZE] Bracketed space: {original} -> {generalized}")
                     return generalized
 
-        # Pattern 2: user@host:/path$ or user@host:/path#
+        # Pattern 2: user@host:/path$ or user@host:~$ or user@host:~/path$
         # Generalize: user@host:*$ or user@host:*#
         if ':' in prompt and '@' in prompt:
             # Replace path after : with *
@@ -620,6 +633,15 @@ class SSHSessionManager:
                     generalized = parts[0] + ':*' + prompt_char
                     logger.debug(f"[GENERALIZE] Path colon: {original} -> {generalized}")
                     return generalized
+                # If no prompt char found but there's content after colon, still generalize
+                elif parts[1].strip():
+                    # Assume last character is prompt char
+                    content = parts[1].rstrip()
+                    if content and content[-1] in '>#$%':
+                        prompt_char = content[-1]
+                        generalized = parts[0] + ':*' + prompt_char
+                        logger.debug(f"[GENERALIZE] Path colon (inferred): {original} -> {generalized}")
+                        return generalized
 
         # Pattern 3: user@host directory$ or user@host directory#
         # Generalize: user@host *$ or user@host *#
@@ -634,9 +656,20 @@ class SSHSessionManager:
                 logger.debug(f"[GENERALIZE] Space separated: {original} -> {generalized}")
                 return generalized
 
+        # Pattern 4: Simple prompts with just directory before prompt char
+        # ~/dir$ -> *$ or /path$ -> *$
+        if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
+            match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
+            if match:
+                prompt_char = match.group(2)
+                generalized = '*' + prompt_char
+                logger.debug(f"[GENERALIZE] Simple path: {original} -> {generalized}")
+                return generalized
+
         # No generalization needed
         logger.debug(f"[GENERALIZE] No changes needed: {original}")
         return prompt
+
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
         """Legacy method - now handled by _build_device_profile."""
         if session_key in self._session_shell_types:
@@ -982,7 +1015,7 @@ class SSHSessionManager:
                 # Escape special regex chars except *
                 pattern_str = re.escape(literal_prompt).replace(r'\*', '.*?')
                 # Ensure it matches at end of output
-                pattern = re.compile(pattern_str + r'\s*$')
+                pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
                 logger.debug(f"[PROMPT_CHECK] Using wildcard pattern: {pattern.pattern}")
 
                 match = pattern.search(clean_output.rstrip())
@@ -1014,6 +1047,7 @@ class SSHSessionManager:
         logger.debug(f"[PROMPT_CHECK] No prompt match found")
         logger.debug(f"[PROMPT_CHECK] Clean output last 100 chars: {repr(clean_output[-100:])}")
         return False, clean_output
+
     def _detect_awaiting_input(self, output: str) -> Optional[str]:
         """Detect if command is waiting for user input.
 
@@ -1118,7 +1152,8 @@ class SSHSessionManager:
             start_time = time.time()
             last_recv_time = start_time
             idle_timeout = 2.0
-            prompt_pattern = self._ensure_prompt_pattern(session_key, client, shell=shell)
+            # Ensure prompt pattern exists as fallback
+            self._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
             while time.time() - start_time < timeout:
@@ -1138,56 +1173,52 @@ class SSHSessionManager:
                         logger.info(f"Detected interactive prompt: {awaiting}")
                         return raw_output, "", 0, awaiting
 
-                    # Check for command completion (prompt at end of output)
-                    # Strip ANSI codes before checking for prompt
+                    # Check for command completion using captured prompt or pattern
                     clean_output = self._strip_ansi(raw_output)
                     logger.debug(f"[PROMPT_CHECK] Raw output last 200 chars: {repr(raw_output[-200:])}")
                     logger.debug(f"[PROMPT_CHECK] Clean output last 200 chars: {repr(clean_output[-200:])}")
-                    logger.debug(f"[PROMPT_CHECK] Pattern: {prompt_pattern.pattern}")
 
-                    if prompt_pattern.search(clean_output):
-                        logger.debug(f"Detected command prompt - command complete")
-                        logger.debug(f"Clean output last 100 chars: {repr(clean_output[-100:])}")
+                    is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+
+                    if is_complete:
+                        logger.debug(f"Command complete - prompt detected")
                         # Reset miss count on successful match
                         self._prompt_miss_count[session_key] = 0
                         consecutive_misses = 0
-
-                        # Remove prompt and trailing whitespace from output
-                        output = prompt_pattern.sub('', clean_output).rstrip()
 
                         # If this was a context-changing command, recapture the prompt
                         if context_changing:
                             logger.info(f"Recapturing prompt after context-changing command")
                             with self._lock:
                                 self._session_prompts.pop(session_key, None)
-                            try:
-                                self._capture_prompt(session_key, shell)
-                            except Exception:
-                                logger.debug("Prompt recapture failed (non-fatal)")
+                            self._capture_prompt(session_key, shell)
 
-                        return output, "", 0, None
+                        return cleaned_output, "", 0, None
                     else:
-                        logger.debug(f"[PROMPT_CHECK] No match found")
+                        logger.debug(f"[PROMPT_CHECK] No prompt match found")
                         consecutive_misses += 1
 
-                        # If we've had too many consecutive misses, regenerate the pattern
-                        if consecutive_misses > 5:
+                        # If we've had too many consecutive misses, try recapturing the prompt
+                        if consecutive_misses > 10:
                             miss_count = self._prompt_miss_count.get(session_key, 0) + 1
                             self._prompt_miss_count[session_key] = miss_count
 
                             if miss_count > 3:
-                                logger.warning(f"Prompt pattern failing repeatedly ({miss_count} times), regenerating for {session_key}")
+                                logger.warning(f"Prompt detection failing repeatedly ({miss_count} times), recapturing for {session_key}")
                                 with self._lock:
+                                    self._session_prompts.pop(session_key, None)
                                     self._session_prompt_patterns.pop(session_key, None)
-                                prompt_pattern = self._ensure_prompt_pattern(session_key, client, raw_output, shell)
+                                # Try to recapture prompt
+                                self._capture_prompt(session_key, shell)
+                                self._ensure_prompt_pattern(session_key, client, raw_output, shell)
                                 consecutive_misses = 0
-                                logger.info(f"Regenerated pattern: {prompt_pattern.pattern}")
+                                logger.info(f"Recaptured prompt and regenerated pattern")
                 else:
                     # No data available - check if we should timeout from inactivity
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
                         logger.debug(f"Idle timeout after {idle_timeout}s - cleaning and returning output")
-                        output = self._strip_ansi(raw_output).rstrip()
-                        logger.debug(f"Cleaned output last 100 chars: {repr(output[-100:])}")
+                        clean_output = self._strip_ansi(raw_output)
+                        logger.debug(f"Cleaned output last 100 chars: {repr(clean_output[-100:])}")
 
                         # Check for interactive prompts BEFORE checking for completion
                         awaiting = self._detect_awaiting_input(raw_output)
@@ -1196,21 +1227,18 @@ class SSHSessionManager:
                             return raw_output, "", 0, awaiting
 
                         # Try one more prompt check on cleaned output
-                        if prompt_pattern.search(output):
+                        is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                        if is_complete:
                             logger.debug("Prompt found in cleaned output during idle timeout")
-                            cleaned = prompt_pattern.sub('', output).rstrip()
 
-                            # If this was a context-changing command, recapture the prompt
-                            if context_changing:
-                                logger.info(f"Recapturing prompt after context-changing command (idle timeout)")
-                                with self._lock:
-                                    self._session_prompts.pop(session_key, None)
-                                try:
-                                    self._capture_prompt(session_key, shell)
-                                except Exception:
-                                    logger.debug("Prompt recapture failed (idle timeout)")
+                        # If this was a context-changing command, recapture the prompt
+                        if context_changing and is_complete:
+                            logger.info(f"Recapturing prompt after context-changing command (idle timeout)")
+                            with self._lock:
+                                self._session_prompts.pop(session_key, None)
+                            self._capture_prompt(session_key, shell)
 
-                            return cleaned, "", 0, None
+                        return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")
