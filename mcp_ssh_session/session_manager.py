@@ -183,25 +183,29 @@ class SSHSessionManager:
     def _enter_enable_mode(self, session_key: str, client: paramiko.SSHClient,
                            enable_password: str, enable_command: str = "enable",
                            timeout: int = ENABLE_MODE_TIMEOUT) -> tuple[bool, str]:
-        """Enter enable mode on a network device."""
+        """Enter enable mode on a network device using the persistent shell."""
         logger = self.logger.getChild('enable_mode')
         logger.info(f"Starting enable mode workflow for {session_key}")
 
-        shell = None
         try:
-            shell = client.invoke_shell()
-            time.sleep(1)
+            # Get the persistent shell for this session
+            shell = self._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
 
+            # Disable paging on network devices
             shell.send("terminal length 0\n")
             time.sleep(0.5)
 
+            # Clear any output from the paging command
             output = ""
             if shell.recv_ready():
                 output = shell.recv(4096).decode('utf-8', errors='ignore')
 
+            # Send the enable command
             shell.send(f"{enable_command}\n")
             time.sleep(0.5)
 
+            # Wait for password prompt or enable prompt
             start_time = time.time()
             password_sent = False
             while time.time() - start_time < timeout:
@@ -209,12 +213,22 @@ class SSHSessionManager:
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
 
-                    if '#' in output:
-                        logger.debug("Already in enable mode")
+                    # Check if already in enable mode (prompt ends with #)
+                    if '#' in output and output.strip().endswith('#'):
+                        logger.info("Already in enable mode")
                         self._enable_mode[session_key] = True
-                        return True, (shell, output.strip())
+                        # Update the session prompt to use # for enable mode
+                        if session_key in self._session_prompts:
+                            old_prompt = self._session_prompts[session_key]
+                            # Replace > with # for enable mode prompt
+                            enable_prompt = old_prompt.replace('>', '#')
+                            self._session_prompts[session_key] = enable_prompt
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}'")
+                        return True, "Already in enable mode"
 
+                    # Check for password prompt
                     if re.search(r'[Pp]assword:|password.*:', output):
+                        logger.info("Sending enable password")
                         shell.send(f"{enable_password}\n")
                         time.sleep(0.5)
                         password_sent = True
@@ -224,30 +238,36 @@ class SSHSessionManager:
             if not password_sent:
                 error_msg = f"Timeout waiting for enable password prompt. Output: {output}"
                 logger.error(error_msg)
-                shell.close()
                 return False, error_msg
 
+            # Wait for enable prompt after sending password
             output = ""
             start_time = time.time()
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
-                    if '#' in output:
+                    # Check if we now have the enable prompt (#)
+                    if '#' in output and output.strip().endswith('#'):
+                        logger.info("Successfully entered enable mode")
                         self._enable_mode[session_key] = True
-                        return True, (shell, output.strip())
+                        # Update the session prompt to use # for enable mode
+                        if session_key in self._session_prompts:
+                            old_prompt = self._session_prompts[session_key]
+                            # Replace > with # for enable mode prompt
+                            enable_prompt = old_prompt.replace('>', '#')
+                            self._session_prompts[session_key] = enable_prompt
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}'")
+                        return True, "Entered enable mode successfully"
                 time.sleep(0.1)
 
             error_msg = f"Timeout waiting for enable prompt. Output: {output}"
             logger.error(error_msg)
-            shell.close()
             return False, error_msg
 
         except Exception as exc:
             error_msg = f"Failed to enter enable mode: {exc}"
             logger.error(error_msg, exc_info=True)
-            if shell:
-                shell.close()
             return False, error_msg
 
 
@@ -1207,71 +1227,84 @@ class SSHSessionManager:
     def _execute_enable_mode_command_internal(self, client: paramiko.SSHClient, session_key: str,
                                               command: str, enable_password: str,
                                               enable_command: str, timeout: int) -> tuple[str, str, int]:
-        """Execute a command while the session is in enable mode."""
+        """Execute a command while the session is in enable mode using the persistent shell."""
         logger = self.logger.getChild('enable_mode_command')
 
-        shell = None
-        if not self._enable_mode.get(session_key, False):
-            success, result = self._enter_enable_mode(session_key, client, enable_password, enable_command)
-            if not success:
-                return "", f"Failed to enter enable mode: {result}", 1
-            shell, _ = result
-        else:
-            shell = client.invoke_shell()
-            time.sleep(0.5)
+        try:
+            # Enter enable mode if not already in it
+            if not self._enable_mode.get(session_key, False):
+                success, message = self._enter_enable_mode(session_key, client, enable_password, enable_command)
+                if not success:
+                    return "", f"Failed to enter enable mode: {message}", 1
+
+            # Get the persistent shell for this session
+            shell = self._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            # Clear any pending output
             if shell.recv_ready():
                 shell.recv(4096)
 
-        try:
-            shell.settimeout(timeout)
+            # Send the command
             shell.send(f"{command}\n")
             time.sleep(0.5)
 
             output_limiter = OutputLimiter()
-            output = ""
+            raw_output = ""
             start_time = time.time()
+            last_output_time = time.time()
+            idle_timeout = 2.0  # Consider command complete after 2 seconds of no output
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    output += limited_chunk
+                    raw_output += limited_chunk
+                    last_output_time = time.time()
 
                     if not should_continue:
                         break
 
-                    if output.strip().endswith(('#', '>')):
+                    # Check for network device prompt (# or >)
+                    if raw_output.strip().endswith(('#', '>')):
+                        # Wait a bit to see if more output arrives
                         time.sleep(0.5)
                         if shell.recv_ready():
                             more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                             limited_more, _ = output_limiter.add_chunk(more_chunk)
-                            output += limited_more
+                            raw_output += limited_more
                         break
                 else:
+                    # No data available - check if we've been idle long enough
+                    if time.time() - last_output_time >= idle_timeout and raw_output:
+                        logger.debug(f"Idle timeout reached after {idle_timeout}s - command appears complete")
+                        break
                     time.sleep(0.1)
             else:
-                return output, f"Command timed out after {timeout} seconds", 124
+                return raw_output, f"Command timed out after {timeout} seconds", 124
 
-            lines = output.split('\n')
+            # Clean up the output
+            # Remove ANSI escape codes
+            clean_output = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', raw_output)
+
+            # Split into lines and remove the command echo and prompt
+            lines = clean_output.split('\n')
             if len(lines) > 1:
                 cleaned_lines = []
-                for line in lines[1:]:
+                for line in lines[1:]:  # Skip first line (command echo)
                     stripped = line.strip()
+                    # Skip empty lines and lines that are just the prompt
                     if stripped and not stripped.endswith(('#', '>')):
                         cleaned_lines.append(stripped)
                 output = '\n'.join(cleaned_lines).strip()
+            else:
+                output = clean_output.strip()
 
             return output, "", 0
 
         except Exception as exc:
             logger.error(f"Enable mode command error: {exc}", exc_info=True)
             return "", f"Error executing enable mode command: {exc}", 1
-        finally:
-            try:
-                if shell:
-                    shell.close()
-            except Exception:
-                pass
 
     def send_input_by_session(self, host: str, input_text: str, username: Optional[str] = None,
                               port: Optional[int] = None) -> tuple[bool, str, str]:
