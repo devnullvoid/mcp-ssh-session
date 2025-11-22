@@ -1159,6 +1159,14 @@ class SSHSessionManager:
                     awaiting = self._detect_awaiting_input(raw_output)
                     if awaiting:
                         logger.info(f"Detected interactive prompt: {awaiting}")
+                        # Automatically handle pagers by sending 'q' to quit
+                        if awaiting == "pager":
+                            logger.info("Automatically handling pager - sending 'q' to quit")
+                            shell.send('q')
+                            # Continue collecting output after quitting pager
+                            time.sleep(0.3)
+                            continue
+                        # For other types of input (password, etc.), return and let agent handle
                         return raw_output, "", 0, awaiting
 
                     # Check for command completion using captured prompt or pattern
@@ -1206,6 +1214,15 @@ class SSHSessionManager:
                         awaiting = self._detect_awaiting_input(raw_output)
                         if awaiting:
                             logger.info(f"Detected interactive prompt during idle timeout: {awaiting}")
+                            # Automatically handle pagers by sending 'q' to quit
+                            if awaiting == "pager":
+                                logger.info("Automatically handling pager during idle timeout - sending 'q' to quit")
+                                shell.send('q')
+                                # Reset idle timer and continue collecting
+                                last_recv_time = time.time()
+                                time.sleep(0.3)
+                                continue
+                            # For other types of input (password, etc.), return and let agent handle
                             return raw_output, "", 0, awaiting
 
                         # Try one more prompt check on cleaned output

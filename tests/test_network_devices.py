@@ -96,30 +96,32 @@ class TestCiscoStyleDevices:
         and EdgeSwitch/other vendor style ('configure').
         """
 
-        # First, detect which configure command the device uses
-        # Try Cisco style first
-        check_stdout, _, _ = session_manager.execute_command(
+        # Detect which configure command syntax the device uses by checking for EdgeSwitch
+        # EdgeSwitch uses 'configure', Cisco uses 'configure terminal'
+        # We can detect this without actually entering/exiting modes
+        version_stdout, _, _ = session_manager.execute_command(
             host=ssh_config['host'],
             username=ssh_config['username'],
             password=ssh_config['password'],
             key_filename=ssh_config['key_filename'],
             port=ssh_config['port'],
             enable_password=ssh_config['enable_password'],
-            command="configure terminal\nexit",
+            command="show version",
             timeout=10
         )
 
-        # Determine which syntax to use
-        if "Invalid input" in check_stdout or "% " in check_stdout:
-            # Try non-Cisco style (just "configure")
-            print("Detected non-Cisco device, using 'configure' command")
+        # Determine which syntax to use based on device type
+        if "EdgeSwitch" in version_stdout or "Ubiquiti" in version_stdout:
+            # EdgeSwitch style
+            print("Detected EdgeSwitch/Ubiquiti device, using 'configure' command")
             config_enter = "configure"
         else:
             # Cisco style
             print("Detected Cisco-style device, using 'configure terminal' command")
             config_enter = "configure terminal"
 
-        # Enter configure mode, verify prompt detection by running a harmless command, then exit
+        # Enter configure mode, verify prompt detection by running help, then exit back to enable mode
+        # IMPORTANT: exit once to leave configure mode, but stay in enable mode
         commands = f"""
 {config_enter}
 ?
