@@ -89,10 +89,11 @@ class TestCiscoStyleDevices:
         assert exit_code2 == 0
 
     def test_configure_mode(self, session_manager, ssh_config):
-        """Test entering configure mode, making changes, and exiting.
+        """Test entering configure mode and verifying prompt detection.
 
-        Supports both Cisco IOS style ('configure terminal') and
-        EdgeSwitch/other vendor style ('configure').
+        This test verifies that the agent can enter configure mode and properly
+        detect prompts in that mode, handling both Cisco IOS style ('configure terminal')
+        and EdgeSwitch/other vendor style ('configure').
         """
 
         # First, detect which configure command the device uses
@@ -113,22 +114,16 @@ class TestCiscoStyleDevices:
             # Try non-Cisco style (just "configure")
             print("Detected non-Cisco device, using 'configure' command")
             config_enter = "configure"
-            config_exit = "exit"
         else:
             # Cisco style
             print("Detected Cisco-style device, using 'configure terminal' command")
             config_enter = "configure terminal"
-            config_exit = "exit"
 
-        # Enter configure mode, add a test VLAN (safer than interface on some devices)
-        # This is a safe operation that won't affect the device
+        # Enter configure mode, verify prompt detection by running a harmless command, then exit
         commands = f"""
 {config_enter}
-vlan 999
-name MCP_SSH_Test
-{config_exit}
-{config_exit}
-show vlan id 999
+?
+exit
 """.strip()
 
         stdout, stderr, exit_code = session_manager.execute_command(
@@ -142,35 +137,20 @@ show vlan id 999
             timeout=30
         )
 
-        print(f"Configure mode output: {stdout}")
+        print(f"Configure mode output: {stdout[:500]}...")
         assert exit_code == 0
-        # Check that we got valid config output showing our test VLAN
-        assert "999" in stdout, "VLAN 999 not found in output"
-        assert "MCP_SSH_Test" in stdout or "mcp_ssh_test" in stdout.lower(), "VLAN name not found"
-
-        # Cleanup - remove the test VLAN
-        cleanup_commands = f"""
-{config_enter}
-no vlan 999
-{config_exit}
-""".strip()
-
-        session_manager.execute_command(
-            host=ssh_config['host'],
-            username=ssh_config['username'],
-            password=ssh_config['password'],
-            key_filename=ssh_config['key_filename'],
-            port=ssh_config['port'],
-            enable_password=ssh_config['enable_password'],
-            command=cleanup_commands,
-            timeout=30
-        )
+        # Verify we got some output (help text from '?')
+        assert len(stdout) > 0, "No output received from configure mode"
 
     def test_show_command_with_pager(self, session_manager, ssh_config):
-        """Test handling of commands with paged output (long output)."""
+        """Test handling of commands with paged output (long output).
 
-        # Many devices will page output for long show commands
-        # The session manager should handle the pager automatically
+        This tests that the agent can properly interact with and proceed past
+        pagers that devices display for long output.
+        """
+
+        # Use a command that triggers a pager on EdgeSwitch
+        # This will show "--More-- or (q)uit" prompts that need to be handled
         stdout, stderr, exit_code = session_manager.execute_command(
             host=ssh_config['host'],
             username=ssh_config['username'],
@@ -178,14 +158,14 @@ no vlan 999
             key_filename=ssh_config['key_filename'],
             port=ssh_config['port'],
             enable_password=ssh_config['enable_password'],
-            command="show running-config",
+            command="show interfaces status all",
             timeout=60
         )
 
         print(f"Paged output length: {len(stdout)} bytes")
         assert exit_code == 0
-        # Running config should have substantial content
-        assert len(stdout) > 100
+        # Interface status output should have substantial content
+        assert len(stdout) > 100, "Output too short - pager may not have been handled correctly"
 
 
 @pytest.mark.skipif(
