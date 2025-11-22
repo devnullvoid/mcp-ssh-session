@@ -89,7 +89,27 @@ class TestCiscoStyleDevices:
         assert exit_code2 == 0
 
     def test_configure_mode(self, session_manager, ssh_config):
-        """Test entering configure mode, making changes, and exiting."""
+        """Test entering configure mode, making changes, and exiting.
+
+        Note: This test uses Cisco IOS commands and will be skipped on devices
+        that don't support 'configure terminal' mode (like EdgeSwitch).
+        """
+
+        # First, check if the device supports configure terminal
+        check_stdout, _, check_exit = session_manager.execute_command(
+            host=ssh_config['host'],
+            username=ssh_config['username'],
+            password=ssh_config['password'],
+            key_filename=ssh_config['key_filename'],
+            port=ssh_config['port'],
+            enable_password=ssh_config['enable_password'],
+            command="configure terminal\nexit",
+            timeout=10
+        )
+
+        # Skip if device doesn't support configure terminal
+        if "Invalid input" in check_stdout or "% " in check_stdout:
+            pytest.skip("Device doesn't support Cisco IOS 'configure terminal' mode")
 
         # Enter configure mode, add a comment to config, then exit
         # This is a safe operation that won't affect the device
@@ -115,7 +135,9 @@ show running-config interface Loopback999
 
         print(f"Configure mode output: {stdout}")
         assert exit_code == 0
-        assert "Loopback999" in stdout or "loopback999" in stdout.lower()
+        # Check that we got valid config output, not error messages
+        assert "Invalid input" not in stdout, "Device reported invalid input"
+        assert "description Test interface" in stdout or "Description: Test interface" in stdout
 
         # Cleanup - remove the test interface
         cleanup_commands = """
