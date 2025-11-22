@@ -1003,11 +1003,18 @@ class SSHSessionManager:
                 # Ensure it matches at end of output
                 pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
 
+                # Debug: show what we're matching against
+                last_100 = clean_output.rstrip()[-100:] if len(clean_output) > 100 else clean_output.rstrip()
+                logger.debug(f"Checking wildcard pattern '{literal_prompt}' (regex: '{pattern.pattern}') against last 100 chars: {repr(last_100)}")
+
                 match = pattern.search(clean_output.rstrip())
                 if match:
                     # Remove the matched prompt from output
                     output = clean_output[:match.start()].rstrip()
+                    logger.debug(f"Wildcard pattern matched! Matched text: {repr(match.group())}")
                     return True, output
+                else:
+                    logger.debug(f"Wildcard pattern did not match")
             else:
                 # Exact literal match
                 if clean_output.rstrip().endswith(literal_prompt):
