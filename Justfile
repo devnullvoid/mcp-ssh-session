@@ -23,11 +23,11 @@ test:
     echo "SSH test environment variables:"
     echo "  SSH_TEST_HOST='${SSH_TEST_HOST:-<not set>}'"
     echo "  SSH_TEST_USER='${SSH_TEST_USER:-<not set>}'"
-    echo "  SSH_TEST_PASSWORD='${SSH_TEST_PASSWORD:+***}${SSH_TEST_PASSWORD:-<not set>}'"
+    if [ -n "${SSH_TEST_PASSWORD:-}" ]; then echo "  SSH_TEST_PASSWORD='***'"; else echo "  SSH_TEST_PASSWORD='<not set>'"; fi
     echo "  SSH_TEST_KEY_FILE='${SSH_TEST_KEY_FILE:-<not set>}'"
     echo "  SSH_TEST_PORT='${SSH_TEST_PORT:-22}'"
-    echo "  SSH_TEST_SUDO_PASSWORD='${SSH_TEST_SUDO_PASSWORD:+***}${SSH_TEST_SUDO_PASSWORD:-<not set>}'"
-    echo "  SSH_TEST_ENABLE_PASSWORD='${SSH_TEST_ENABLE_PASSWORD:+***}${SSH_TEST_ENABLE_PASSWORD:-<not set>}'"
+    if [ -n "${SSH_TEST_SUDO_PASSWORD:-}" ]; then echo "  SSH_TEST_SUDO_PASSWORD='***'"; else echo "  SSH_TEST_SUDO_PASSWORD='<not set>'"; fi
+    if [ -n "${SSH_TEST_ENABLE_PASSWORD:-}" ]; then echo "  SSH_TEST_ENABLE_PASSWORD='***'"; else echo "  SSH_TEST_ENABLE_PASSWORD='<not set>'"; fi
     echo ""
 
     # Run pytest

@@ -851,54 +851,90 @@ class SSHSessionManager:
 
     def _execute_sudo_command_internal(self, client: paramiko.SSHClient, command: str,
                                        sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
-        """Execute a sudo command, handling password prompts and output limiting."""
+        """Execute a sudo command using the persistent shell, handling password prompts.
+
+        Uses the persistent shell from the session to maintain state and benefit from
+        prompt detection.
+        """
         logger = self.logger.getChild('sudo_command')
-        shell = None
+
+        # Get session key for this client
+        # We need to derive the session key from the client
+        # Find the session key that matches this client
+        session_key = None
+        with self._lock:
+            for key, sess_client in self._sessions.items():
+                if sess_client == client:
+                    session_key = key
+                    break
+
+        if not session_key:
+            logger.error("Could not find session key for client")
+            return "", "Could not find session for sudo command", 1
 
         try:
             timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
+
+            # Ensure command starts with sudo
             if not command.strip().startswith('sudo'):
                 command = f"sudo {command}"
 
-            shell = client.invoke_shell()
+            # Get the persistent shell
+            shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
-            time.sleep(0.5)
 
-            if shell.recv_ready():
-                _ = shell.recv(4096)
-
+            # Send the command
             shell.send(command + '\n')
             time.sleep(0.5)
 
             output_limiter = OutputLimiter()
-            output = ""
+            raw_output = ""
             password_sent = False
             start_time = time.time()
+            last_recv_time = start_time
+            idle_timeout = 2.0
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    output += limited_chunk
+                    raw_output += limited_chunk
 
-                    if not password_sent and re.search(r'password', chunk, re.IGNORECASE):
+                    # Check for password prompt
+                    if not password_sent and re.search(r'\[sudo\] password|password for', raw_output, re.IGNORECASE):
+                        logger.debug("Detected sudo password prompt, sending password")
                         shell.send(f"{sudo_password}\n")
                         password_sent = True
                         time.sleep(0.3)
                         continue
 
                     if not should_continue:
-                        return output, f"Output truncated at {output_limiter.max_size} bytes", 124
+                        return raw_output, f"Output truncated at {output_limiter.max_size} bytes", 124
 
-                    if password_sent and ('#' in chunk or '$' in chunk):
-                        time.sleep(0.3)
-                        break
+                    # Check for command completion using prompt detection
+                    clean_output = self._strip_ansi(raw_output)
+                    is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+
+                    if is_complete:
+                        logger.debug("Sudo command completed (prompt detected)")
+                        return cleaned_output, "", 0
                 else:
-                    time.sleep(0.1)
-            else:
-                return output, f"Command timed out after {timeout} seconds", 124
+                    # Check idle timeout
+                    if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        logger.debug("Sudo command idle timeout, checking completion")
+                        clean_output = self._strip_ansi(raw_output)
+                        is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                        if is_complete:
+                            logger.debug("Sudo command completed (idle timeout)")
+                            return cleaned_output, "", 0
+                        # If not complete but idle, wait a bit more
 
-            return output.strip(), "", 0
+                    time.sleep(0.1)
+
+            # Timeout reached
+            logger.warning(f"Sudo command timed out after {timeout}s")
+            return raw_output.strip(), f"Command timed out after {timeout} seconds", 124
 
         except paramiko.SSHException as exc:
             logger.error(f"SSH error during sudo command: {exc}")
@@ -906,12 +942,6 @@ class SSHSessionManager:
         except Exception as exc:
             logger.error(f"Error executing sudo command: {exc}", exc_info=True)
             return "", f"Error executing sudo command: {exc}", 1
-        finally:
-            if shell:
-                try:
-                    shell.close()
-                except Exception:
-                    pass
 
     def _execute_sudo_command(self, client: paramiko.SSHClient, command: str,
                                sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
