@@ -218,15 +218,15 @@ class SSHSessionManager:
                         logger.info("Already in enable mode")
                         self._enable_mode[session_key] = True
                         # Update the session prompt to use # for enable mode
-                        # And make it flexible to match mode changes like (Config)#
+                        # And make it flexible to match mode changes like (Config)# and mode drops to >
                         if session_key in self._session_prompts:
                             old_prompt = self._session_prompts[session_key]
-                            # Replace > with # for enable mode, and add wildcard for mode variations
-                            # e.g., (SW1) > becomes (SW1)*# to match (SW1) # and (SW1) (Config)#
+                            # Use regex pattern to match both > and # with mode variations
+                            # e.g., (SW1) > becomes (SW1)*[>#] to match (SW1) #, (SW1) >, (SW1) (Config)#, etc.
                             base_prompt = old_prompt.replace('>', '')  # Remove the >
-                            enable_prompt = base_prompt + '*#'  # Add wildcard and #
+                            enable_prompt = base_prompt + '*[>#]'  # Add wildcard and character class for > or #
                             self._session_prompts[session_key] = enable_prompt
-                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations)")
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations and > or #)")
                         return True, "Already in enable mode"
 
                     # Check for password prompt
@@ -255,15 +255,15 @@ class SSHSessionManager:
                         logger.info("Successfully entered enable mode")
                         self._enable_mode[session_key] = True
                         # Update the session prompt to use # for enable mode
-                        # And make it flexible to match mode changes like (Config)#
+                        # And make it flexible to match mode changes like (Config)# and mode drops to >
                         if session_key in self._session_prompts:
                             old_prompt = self._session_prompts[session_key]
-                            # Replace > with # for enable mode, and add wildcard for mode variations
-                            # e.g., (SW1) > becomes (SW1)*# to match (SW1) # and (SW1) (Config)#
+                            # Use regex pattern to match both > and # with mode variations
+                            # e.g., (SW1) > becomes (SW1)*[>#] to match (SW1) #, (SW1) >, (SW1) (Config)#, etc.
                             base_prompt = old_prompt.replace('>', '')  # Remove the >
-                            enable_prompt = base_prompt + '*#'  # Add wildcard and #
+                            enable_prompt = base_prompt + '*[>#]'  # Add wildcard and character class for > or #
                             self._session_prompts[session_key] = enable_prompt
-                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations)")
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations and > or #)")
                         return True, "Entered enable mode successfully"
                 time.sleep(0.1)
 
@@ -995,11 +995,13 @@ class SSHSessionManager:
         if session_key in self._session_prompts:
             literal_prompt = self._session_prompts[session_key]
 
-            # Check if prompt contains wildcards (generalized)
-            if '*' in literal_prompt:
+            # Check if prompt contains wildcards or character classes (generalized)
+            if '*' in literal_prompt or '[' in literal_prompt:
                 # Convert to pattern for wildcard matching
-                # Escape special regex chars except *
+                # Escape special regex chars except * and []
                 pattern_str = re.escape(literal_prompt).replace(r'\*', '.*?')
+                # Un-escape character classes like [>#]
+                pattern_str = pattern_str.replace(r'\[', '[').replace(r'\]', ']')
                 # Ensure it matches at end of output
                 pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
 
