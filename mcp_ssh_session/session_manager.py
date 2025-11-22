@@ -1265,14 +1265,11 @@ class SSHSessionManager:
                     if not should_continue:
                         break
 
-                    # Check for network device prompt (# or >)
-                    if raw_output.strip().endswith(('#', '>')):
-                        # Wait a bit to see if more output arrives
-                        time.sleep(0.5)
-                        if shell.recv_ready():
-                            more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                            limited_more, _ = output_limiter.add_chunk(more_chunk)
-                            raw_output += limited_more
+                    # Use proper prompt detection instead of naive character checking
+                    clean_output = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', raw_output)
+                    is_complete, _ = self._check_prompt_completion(session_key, raw_output, clean_output)
+                    if is_complete:
+                        logger.debug("Prompt detected - command complete")
                         break
                 else:
                     # No data available - check if we've been idle long enough
@@ -1283,22 +1280,17 @@ class SSHSessionManager:
             else:
                 return raw_output, f"Command timed out after {timeout} seconds", 124
 
-            # Clean up the output
-            # Remove ANSI escape codes
+            # Clean up the output using proper prompt detection
             clean_output = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', raw_output)
+            is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
 
-            # Split into lines and remove the command echo and prompt
-            lines = clean_output.split('\n')
-            if len(lines) > 1:
-                cleaned_lines = []
-                for line in lines[1:]:  # Skip first line (command echo)
-                    stripped = line.strip()
-                    # Skip empty lines and lines that are just the prompt
-                    if stripped and not stripped.endswith(('#', '>')):
-                        cleaned_lines.append(stripped)
-                output = '\n'.join(cleaned_lines).strip()
+            # Remove the command echo (first line)
+            lines = cleaned_output.split('\n')
+            if len(lines) > 1 and lines[0].strip() in command:
+                # First line is command echo, skip it
+                output = '\n'.join(lines[1:]).strip()
             else:
-                output = clean_output.strip()
+                output = cleaned_output.strip()
 
             return output, "", 0
 
