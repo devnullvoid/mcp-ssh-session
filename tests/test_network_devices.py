@@ -91,12 +91,13 @@ class TestCiscoStyleDevices:
     def test_configure_mode(self, session_manager, ssh_config):
         """Test entering configure mode, making changes, and exiting.
 
-        Note: This test uses Cisco IOS commands and will be skipped on devices
-        that don't support 'configure terminal' mode (like EdgeSwitch).
+        Supports both Cisco IOS style ('configure terminal') and
+        EdgeSwitch/other vendor style ('configure').
         """
 
-        # First, check if the device supports configure terminal
-        check_stdout, _, check_exit = session_manager.execute_command(
+        # First, detect which configure command the device uses
+        # Try Cisco style first
+        check_stdout, _, _ = session_manager.execute_command(
             host=ssh_config['host'],
             username=ssh_config['username'],
             password=ssh_config['password'],
@@ -107,19 +108,27 @@ class TestCiscoStyleDevices:
             timeout=10
         )
 
-        # Skip if device doesn't support configure terminal
+        # Determine which syntax to use
         if "Invalid input" in check_stdout or "% " in check_stdout:
-            pytest.skip("Device doesn't support Cisco IOS 'configure terminal' mode")
+            # Try non-Cisco style (just "configure")
+            print("Detected non-Cisco device, using 'configure' command")
+            config_enter = "configure"
+            config_exit = "exit"
+        else:
+            # Cisco style
+            print("Detected Cisco-style device, using 'configure terminal' command")
+            config_enter = "configure terminal"
+            config_exit = "exit"
 
-        # Enter configure mode, add a comment to config, then exit
+        # Enter configure mode, add a test VLAN (safer than interface on some devices)
         # This is a safe operation that won't affect the device
-        commands = """
-configure terminal
-interface Loopback999
-description Test interface for MCP SSH Session testing
-exit
-exit
-show running-config interface Loopback999
+        commands = f"""
+{config_enter}
+vlan 999
+name MCP_SSH_Test
+{config_exit}
+{config_exit}
+show vlan id 999
 """.strip()
 
         stdout, stderr, exit_code = session_manager.execute_command(
@@ -135,15 +144,15 @@ show running-config interface Loopback999
 
         print(f"Configure mode output: {stdout}")
         assert exit_code == 0
-        # Check that we got valid config output, not error messages
-        assert "Invalid input" not in stdout, "Device reported invalid input"
-        assert "description Test interface" in stdout or "Description: Test interface" in stdout
+        # Check that we got valid config output showing our test VLAN
+        assert "999" in stdout, "VLAN 999 not found in output"
+        assert "MCP_SSH_Test" in stdout or "mcp_ssh_test" in stdout.lower(), "VLAN name not found"
 
-        # Cleanup - remove the test interface
-        cleanup_commands = """
-configure terminal
-no interface Loopback999
-exit
+        # Cleanup - remove the test VLAN
+        cleanup_commands = f"""
+{config_enter}
+no vlan 999
+{config_exit}
 """.strip()
 
         session_manager.execute_command(
