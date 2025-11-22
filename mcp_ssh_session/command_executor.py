@@ -63,8 +63,6 @@ class CommandExecutor:
         while time.time() - start < timeout:
             status = self.get_command_status(command_id)
             poll_count += 1
-            if poll_count % 10 == 0:
-                logger.debug(f"[EXEC_POLL] count={poll_count}, status={status.get('status')}")
 
             if 'error' in status:
                 logger.error(f"[EXEC_ERROR] {status['error']}")
@@ -223,7 +221,6 @@ class CommandExecutor:
     def get_command_status(self, command_id: str) -> dict:
         """Get the status and output of an async command."""
         logger = self.logger.getChild('get_status')
-        logger.debug(f"Fetching status for command_id: {command_id}")
         with self._lock:
             if command_id not in self._commands:
                 logger.error(f"Command ID not found: {command_id}")
@@ -242,7 +239,6 @@ class CommandExecutor:
                 "end_time": cmd.end_time.isoformat() if cmd.end_time else None,
                 "awaiting_input_reason": cmd.awaiting_input_reason
             }
-            logger.debug(f"Status for {command_id}: {status_payload['status']}")
             return status_payload
 
     def interrupt_command_by_id(self, command_id: str) -> tuple[bool, str]:

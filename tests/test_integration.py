@@ -7,9 +7,23 @@ from mcp_ssh_session.session_manager import SSHSessionManager
 # Configure logging to see what's happening during tests
 logging.basicConfig(level=logging.DEBUG)
 
+def _is_network_device(host):
+    """Check if a host appears to be a network device rather than Unix/Linux."""
+    # This is a simple heuristic - you may want to make it more sophisticated
+    # Network devices often have names like router, switch, fw, etc.
+    if not host:
+        return False
+    host_lower = host.lower()
+    network_indicators = ['router', 'switch', 'sw', 'fw', 'firewall', 'gw', 'gateway', 'ap']
+    return any(indicator in host_lower for indicator in network_indicators)
+
 @pytest.mark.skipif(
     not os.environ.get("SSH_TEST_HOST"),
     reason="Skipping integration tests: SSH_TEST_HOST not set"
+)
+@pytest.mark.skipif(
+    _is_network_device(os.environ.get("SSH_TEST_HOST")),
+    reason="Skipping Unix/Linux integration tests: host appears to be a network device. Use test_network_devices.py instead."
 )
 class TestSSHIntegration:
     @pytest.fixture(scope="class")
