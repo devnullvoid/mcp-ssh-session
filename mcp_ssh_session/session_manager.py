@@ -218,12 +218,15 @@ class SSHSessionManager:
                         logger.info("Already in enable mode")
                         self._enable_mode[session_key] = True
                         # Update the session prompt to use # for enable mode
+                        # And make it flexible to match mode changes like (Config)#
                         if session_key in self._session_prompts:
                             old_prompt = self._session_prompts[session_key]
-                            # Replace > with # for enable mode prompt
-                            enable_prompt = old_prompt.replace('>', '#')
+                            # Replace > with # for enable mode, and add wildcard for mode variations
+                            # e.g., (SW1) > becomes (SW1)*# to match (SW1) # and (SW1) (Config)#
+                            base_prompt = old_prompt.replace('>', '')  # Remove the >
+                            enable_prompt = base_prompt + '*#'  # Add wildcard and #
                             self._session_prompts[session_key] = enable_prompt
-                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}'")
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations)")
                         return True, "Already in enable mode"
 
                     # Check for password prompt
@@ -252,12 +255,15 @@ class SSHSessionManager:
                         logger.info("Successfully entered enable mode")
                         self._enable_mode[session_key] = True
                         # Update the session prompt to use # for enable mode
+                        # And make it flexible to match mode changes like (Config)#
                         if session_key in self._session_prompts:
                             old_prompt = self._session_prompts[session_key]
-                            # Replace > with # for enable mode prompt
-                            enable_prompt = old_prompt.replace('>', '#')
+                            # Replace > with # for enable mode, and add wildcard for mode variations
+                            # e.g., (SW1) > becomes (SW1)*# to match (SW1) # and (SW1) (Config)#
+                            base_prompt = old_prompt.replace('>', '')  # Remove the >
+                            enable_prompt = base_prompt + '*#'  # Add wildcard and #
                             self._session_prompts[session_key] = enable_prompt
-                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}'")
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations)")
                         return True, "Entered enable mode successfully"
                 time.sleep(0.1)
 
