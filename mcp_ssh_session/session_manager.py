@@ -110,14 +110,12 @@ class SSHSessionManager:
             port: SSH port (optional, will use config if available, default 22)
         """
         logger = self.logger.getChild('get_session')
-        logger.debug(f"Request for session to {host} for user {username}")
 
         # Get SSH config for this host
         host_config, resolved_host, resolved_username, resolved_port, session_key = self._resolve_connection(
             host, username, port
         )
         resolved_key = key_filename or host_config.get('identityfile', [None])[0]
-        logger.debug(f"Resolved session key: {session_key}")
 
         with self._lock:
             if session_key in self._sessions:
@@ -147,18 +145,13 @@ class SSHSessionManager:
                 'port': resolved_port,
                 'username': resolved_username,
             }
-            logger.debug(f"Connection parameters: {connect_kwargs}")
 
             if password:
                 connect_kwargs['password'] = password
-                logger.debug("Connecting with password")
             elif resolved_key:
                 # Expand ~ in key path
                 expanded_key = os.path.expanduser(resolved_key)
                 connect_kwargs['key_filename'] = expanded_key
-                logger.debug(f"Connecting with key: {expanded_key}")
-            else:
-                logger.debug("Connecting without password or key (agent or no auth)")
 
             try:
                 # Add connection timeout to prevent hangs
@@ -166,23 +159,21 @@ class SSHSessionManager:
                 connect_kwargs['banner_timeout'] = 30  # 30 second banner timeout
                 connect_kwargs['auth_timeout'] = 30  # 30 second auth timeout
 
-                logger.debug(f"[CONN_DEBUG] Attempting connection to {resolved_host}:{resolved_port}")
                 client.connect(**connect_kwargs)
-                logger.debug(f"[CONN_DEBUG] Connection successful to {resolved_host}:{resolved_port}")
 
                 self._sessions[session_key] = client
                 logger.info(f"Successfully created new session: {session_key}")
                 return client
             except (paramiko.AuthenticationException, paramiko.SSHException,
                     paramiko.NoValidConnectionsError, OSError, TimeoutError) as e:
-                logger.error(f"[CONN_DEBUG] Connection failed to {session_key}: {type(e).__name__}: {e}")
+                logger.error(f"Connection failed to {session_key}: {type(e).__name__}: {e}")
                 try:
                     client.close()
                 except:
                     pass
                 raise ConnectionError(f"Unable to connect to {resolved_host}:{resolved_port} - {e}")
             except Exception as e:
-                logger.error(f"[CONN_DEBUG] Unexpected error connecting to {session_key}: {type(e).__name__}: {e}", exc_info=True)
+                logger.error(f"Unexpected error connecting to {session_key}: {type(e).__name__}: {e}", exc_info=True)
                 try:
                     client.close()
                 except:
@@ -192,40 +183,55 @@ class SSHSessionManager:
     def _enter_enable_mode(self, session_key: str, client: paramiko.SSHClient,
                            enable_password: str, enable_command: str = "enable",
                            timeout: int = ENABLE_MODE_TIMEOUT) -> tuple[bool, str]:
-        """Enter enable mode on a network device."""
+        """Enter enable mode on a network device using the persistent shell."""
         logger = self.logger.getChild('enable_mode')
         logger.info(f"Starting enable mode workflow for {session_key}")
 
-        shell = None
         try:
-            shell = client.invoke_shell()
-            time.sleep(1)
+            # Get the persistent shell for this session
+            shell = self._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
 
+            # Disable paging on network devices
             shell.send("terminal length 0\n")
             time.sleep(0.5)
 
+            # Clear any output from the paging command
             output = ""
             if shell.recv_ready():
                 output = shell.recv(4096).decode('utf-8', errors='ignore')
-                logger.debug(f"Initial enable output: {output!r}")
 
+            # Send the enable command
             shell.send(f"{enable_command}\n")
             time.sleep(0.5)
 
+            # Wait for password prompt or enable prompt
             start_time = time.time()
             password_sent = False
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
-                    logger.debug(f"Enable chunk: {chunk!r}")
 
-                    if '#' in output:
-                        logger.debug("Already in enable mode")
+                    # Check if already in enable mode (prompt ends with #)
+                    if '#' in output and output.strip().endswith('#'):
+                        logger.info("Already in enable mode")
                         self._enable_mode[session_key] = True
-                        return True, (shell, output.strip())
+                        # Update the session prompt to use # for enable mode
+                        # And make it flexible to match mode changes like (Config)# and mode drops to >
+                        if session_key in self._session_prompts:
+                            old_prompt = self._session_prompts[session_key]
+                            # Use regex pattern to match both > and # with mode variations
+                            # e.g., (SW1) > becomes (SW1)*[>#] to match (SW1) #, (SW1) >, (SW1) (Config)#, etc.
+                            base_prompt = old_prompt.replace('>', '')  # Remove the >
+                            enable_prompt = base_prompt + '*[>#]'  # Add wildcard and character class for > or #
+                            self._session_prompts[session_key] = enable_prompt
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations and > or #)")
+                        return True, "Already in enable mode"
 
+                    # Check for password prompt
                     if re.search(r'[Pp]assword:|password.*:', output):
+                        logger.info("Sending enable password")
                         shell.send(f"{enable_password}\n")
                         time.sleep(0.5)
                         password_sent = True
@@ -235,30 +241,39 @@ class SSHSessionManager:
             if not password_sent:
                 error_msg = f"Timeout waiting for enable password prompt. Output: {output}"
                 logger.error(error_msg)
-                shell.close()
                 return False, error_msg
 
+            # Wait for enable prompt after sending password
             output = ""
             start_time = time.time()
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     output += chunk
-                    if '#' in output:
+                    # Check if we now have the enable prompt (#)
+                    if '#' in output and output.strip().endswith('#'):
+                        logger.info("Successfully entered enable mode")
                         self._enable_mode[session_key] = True
-                        return True, (shell, output.strip())
+                        # Update the session prompt to use # for enable mode
+                        # And make it flexible to match mode changes like (Config)# and mode drops to >
+                        if session_key in self._session_prompts:
+                            old_prompt = self._session_prompts[session_key]
+                            # Use regex pattern to match both > and # with mode variations
+                            # e.g., (SW1) > becomes (SW1)*[>#] to match (SW1) #, (SW1) >, (SW1) (Config)#, etc.
+                            base_prompt = old_prompt.replace('>', '')  # Remove the >
+                            enable_prompt = base_prompt + '*[>#]'  # Add wildcard and character class for > or #
+                            self._session_prompts[session_key] = enable_prompt
+                            logger.info(f"Updated prompt from '{old_prompt}' to '{enable_prompt}' (with wildcard for mode variations and > or #)")
+                        return True, "Entered enable mode successfully"
                 time.sleep(0.1)
 
             error_msg = f"Timeout waiting for enable prompt. Output: {output}"
             logger.error(error_msg)
-            shell.close()
             return False, error_msg
 
         except Exception as exc:
             error_msg = f"Failed to enter enable mode: {exc}"
             logger.error(error_msg, exc_info=True)
-            if shell:
-                shell.close()
             return False, error_msg
 
 
@@ -379,10 +394,9 @@ class SSHSessionManager:
             try:
                 transport = shell.get_transport() if hasattr(shell, 'get_transport') else None
                 if shell.closed or not transport or not transport.is_active():
-                    logger.warning(f"[SHELL_DEAD] Shell for {session_key} is dead. Recreating.")
+                    logger.info(f"Shell for {session_key} is dead, recreating")
                     del self._session_shells[session_key]
                 else:
-                    logger.debug(f"[SHELL_REUSE] Reusing existing shell for {session_key}")
                     client_ref = self._sessions.get(session_key)
                     if client_ref:
                         self._ensure_shell_type(session_key, client_ref)
@@ -391,35 +405,28 @@ class SSHSessionManager:
                             self._capture_prompt(session_key, shell)
                     return shell
             except Exception as exc:
-                logger.warning(f"[SHELL_ERROR] Error checking shell for {session_key}: {exc}. Recreating.")
+                logger.warning(f"Error checking shell for {session_key}: {exc}. Recreating.")
                 if session_key in self._session_shells:
                     del self._session_shells[session_key]
 
-        logger.info(f"[SHELL_CREATE] Creating new persistent shell for {session_key}")
-        logger.debug(f"[SHELL_DEBUG] About to invoke shell for {session_key}")
+        logger.info(f"Creating new persistent shell for {session_key}")
         shell = client.invoke_shell()
         shell.resize_pty(width=100, height=24)
-        logger.debug(f"[SHELL_DEBUG] Shell invoked successfully for {session_key}")
 
         time.sleep(1)  # Give shell time to initialize
         initial_output = ''
         if shell.recv_ready():
             initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
-            logger.debug(f"[SHELL_CREATE] Initial shell output: {initial_output!r}")
-        else:
-            logger.debug(f"[SHELL_DEBUG] No initial output ready for {session_key}")
 
         self._session_shells[session_key] = shell
 
         # Build device profile from shell output instead of exec_command
-        logger.debug(f"[SHELL_DEBUG] Building device profile from shell output")
         self._build_device_profile(session_key, initial_output)
 
         # Capture the actual prompt for this session
-        logger.debug(f"[SHELL_DEBUG] Capturing prompt for {session_key}")
         self._capture_prompt(session_key, shell)
 
-        logger.info(f"[SHELL_READY] New shell for {session_key} is ready.")
+        logger.info(f"New shell for {session_key} is ready")
         return shell
 
     def _build_device_profile(self, session_key: str, initial_output: str):
@@ -461,13 +468,10 @@ class SSHSessionManager:
             else:
                 device_type = 'unknown'
 
-        logger.debug(f"[PROFILE] Detected device type: {device_type} for {session_key}")
         self._session_shell_types[session_key] = device_type
 
         # Set up prompt pattern based on device type and actual output
         self._ensure_prompt_pattern(session_key, None, initial_output)
-
-        logger.debug(f"[PROFILE] Device profile complete for {session_key}: type={device_type}")
 
     def _capture_prompt(self, session_key: str, shell: Any) -> Optional[str]:
         """Capture the actual prompt string for this session by sending a marker command.
@@ -499,17 +503,14 @@ class SSHSessionManager:
                                'checkpoint', 'mikrotik', 'edgeswitch', 'vyos',
                                'openwrt', 'network_device'):
                 # Network devices: just send newline and capture what comes back
-                logger.debug(f"[PROMPT_CAPTURE] Using newline method for network device {session_key}")
                 shell.send('\n')
                 time.sleep(0.3)
 
                 if shell.recv_ready():
                     output = shell.recv(4096).decode('utf-8', errors='ignore')
-                    logger.debug(f"[PROMPT_CAPTURE] Network device output: {repr(output)}")
             else:
                 # Unix/Linux shells: try echo with marker
                 marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
-                logger.debug(f"[PROMPT_CAPTURE] Using echo marker method for {session_key}")
                 shell.send(f'echo "{marker}"\n')
                 time.sleep(0.5)
 
@@ -534,8 +535,7 @@ class SSHSessionManager:
 
                 # If marker not found, fall back to newline method
                 if marker and marker not in output:
-                    logger.warning(f"[PROMPT_CAPTURE] Marker not found, trying newline method for {session_key}")
-                    logger.debug(f"[PROMPT_CAPTURE] Output received: {repr(output)}")
+                    logger.warning(f"Marker not found, trying newline method for {session_key}")
                     # Try simple newline approach
                     shell.send('\n')
                     time.sleep(0.3)
@@ -544,7 +544,7 @@ class SSHSessionManager:
                         marker = None  # Disable marker processing
 
             if not output:
-                logger.warning(f"[PROMPT_CAPTURE] No output received for {session_key}")
+                logger.warning(f"No output received for {session_key}")
                 return None
 
             # Extract the prompt
@@ -554,7 +554,6 @@ class SSHSessionManager:
                 parts = output.split(marker)
                 if len(parts) >= 2:
                     after_marker = parts[-1]
-                    logger.debug(f"[PROMPT_CAPTURE] Text after marker: {repr(after_marker)}")
                     clean_after = self._strip_ansi(after_marker)
                     lines = [line for line in clean_after.split('\n') if line.strip()]
                     if lines:
@@ -562,28 +561,27 @@ class SSHSessionManager:
             else:
                 # Extract prompt from simple output (no marker)
                 clean_output = self._strip_ansi(output)
-                logger.debug(f"[PROMPT_CAPTURE] Clean output: {repr(clean_output)}")
                 lines = [line for line in clean_output.split('\n') if line.strip()]
                 if lines:
                     # Last line is typically the prompt
                     prompt = lines[-1].strip()
 
             if not prompt:
-                logger.warning(f"[PROMPT_CAPTURE] Empty prompt extracted for {session_key}")
+                logger.warning(f"Empty prompt extracted for {session_key}")
                 return None
 
             # Generalize the prompt to handle context changes (directory, etc.)
             generalized_prompt = self._generalize_prompt(prompt, logger)
 
-            logger.info(f"[PROMPT_CAPTURE] Successfully captured prompt for {session_key}: {repr(prompt)}")
+            logger.info(f"Captured prompt for {session_key}: {repr(prompt)}")
             if generalized_prompt != prompt:
-                logger.info(f"[PROMPT_CAPTURE] Generalized to: {repr(generalized_prompt)}")
+                logger.debug(f"Generalized to: {repr(generalized_prompt)}")
 
             self._session_prompts[session_key] = generalized_prompt
             return generalized_prompt
 
         except Exception as exc:
-            logger.error(f"[PROMPT_CAPTURE] Failed to capture prompt for {session_key}: {exc}", exc_info=True)
+            logger.error(f"Failed to capture prompt for {session_key}: {exc}", exc_info=True)
             return None
 
     def _generalize_prompt(self, prompt: str, logger) -> str:
@@ -601,7 +599,6 @@ class SSHSessionManager:
             Generalized prompt pattern (still a literal string with wildcards)
         """
         original = prompt
-        logger.debug(f"[GENERALIZE] Starting with prompt: {repr(prompt)}")
 
         # Pattern 1: [user@host directory]$ or [user@host directory]#
         # Generalize: [user@host *]$ or [user@host *]#
@@ -617,7 +614,6 @@ class SSHSessionManager:
                 if ' ' in bracket_content:
                     parts = bracket_content.rsplit(' ', 1)
                     generalized = parts[0] + ' *]' + prompt_char
-                    logger.debug(f"[GENERALIZE] Bracketed space: {original} -> {generalized}")
                     return generalized
 
         # Pattern 2: user@host:/path$ or user@host:~$ or user@host:~/path$
@@ -631,7 +627,6 @@ class SSHSessionManager:
                 if prompt_char_match:
                     prompt_char = prompt_char_match.group(1)
                     generalized = parts[0] + ':*' + prompt_char
-                    logger.debug(f"[GENERALIZE] Path colon: {original} -> {generalized}")
                     return generalized
                 # If no prompt char found but there's content after colon, still generalize
                 elif parts[1].strip():
@@ -640,7 +635,6 @@ class SSHSessionManager:
                     if content and content[-1] in '>#$%':
                         prompt_char = content[-1]
                         generalized = parts[0] + ':*' + prompt_char
-                        logger.debug(f"[GENERALIZE] Path colon (inferred): {original} -> {generalized}")
                         return generalized
 
         # Pattern 3: user@host directory$ or user@host directory#
@@ -653,7 +647,6 @@ class SSHSessionManager:
                 # Extract user part
                 user_part = prompt.split('@')[0]
                 generalized = user_part + prefix + '*' + prompt_char
-                logger.debug(f"[GENERALIZE] Space separated: {original} -> {generalized}")
                 return generalized
 
         # Pattern 4: Simple prompts with just directory before prompt char
@@ -663,11 +656,9 @@ class SSHSessionManager:
             if match:
                 prompt_char = match.group(2)
                 generalized = '*' + prompt_char
-                logger.debug(f"[GENERALIZE] Simple path: {original} -> {generalized}")
                 return generalized
 
         # No generalization needed
-        logger.debug(f"[GENERALIZE] No changes needed: {original}")
         return prompt
 
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
@@ -695,12 +686,9 @@ class SSHSessionManager:
 
         logger = self.logger.getChild('detect_prompt')
         pattern: Optional[re.Pattern] = None
-        logger.debug(f"[PATTERN_CREATE] Starting pattern detection for {session_key}")
 
         # Try to detect shell type
         shell_type = self._session_shell_types.get(session_key, 'unknown').lower()
-        logger.debug(f"Detecting prompt pattern for {session_key}, shell: {shell_type}")
-        logger.debug(f"[PATTERN_CREATE] Initial output: {repr(initial_output) if initial_output else 'None'}")
 
         # For Fish shell, use a more specific pattern to avoid false positives
         if 'fish' in shell_type:
@@ -711,7 +699,6 @@ class SSHSessionManager:
             # Try to read $PS1 from interactive shell (preferred) or exec_command (fallback)
             if shell:
                 try:
-                    logger.debug("[PATTERN_CREATE] Reading PS1 from interactive shell")
                     # Use markers to extract PS1 from shell output
                     shell.send('echo "___PS1_START___$PS1___PS1_END___"\n')
                     time.sleep(0.5)
@@ -730,25 +717,18 @@ class SSHSessionManager:
                     match = re.search(r'___PS1_START___(.+?)___PS1_END___', output, re.DOTALL)
                     if match:
                         prompt = match.group(1).strip()
-                        logger.debug(f"[PATTERN_CREATE] PS1 from shell: {repr(prompt)}")
                         if prompt and prompt != '$PS1':
                             pattern = self._convert_ps1_to_pattern(prompt, logger)
-                    else:
-                        logger.debug(f"[PATTERN_CREATE] Could not extract PS1 from shell output")
                 except Exception as exc:
                     logger.warning(f"Failed to read PS1 from shell for {session_key}: {exc}")
 
             # Fallback to exec_command if shell method didn't work
             if pattern is None and client:
                 try:
-                    logger.debug("[PATTERN_CREATE] Falling back to exec_command for PS1")
                     stdin, stdout, stderr = client.exec_command('echo $PS1', timeout=10)
                     prompt = stdout.read().decode('utf-8').strip()
-                    logger.debug(f"[PATTERN_CREATE] PS1 raw result: {repr(prompt)}")
                     if prompt and prompt != '$PS1':
                         pattern = self._convert_ps1_to_pattern(prompt, logger)
-                    else:
-                        logger.debug(f"[PATTERN_CREATE] PS1 not usable: {repr(prompt)}")
                 except Exception as exc:
                     logger.warning(f"Failed to read $PS1 for {session_key}: {exc}")
 
@@ -756,22 +736,17 @@ class SSHSessionManager:
         if pattern is None and initial_output:
             fallback = self._extract_prompt_from_output(initial_output)
             if fallback:
-                logger.debug(f"[PATTERN_CREATE] Extracted prompt: {fallback}")
                 # Make extracted prompt flexible for directory changes
                 if '[' in fallback and ']' in fallback:
                     # Support both [user@host dir]$ and [host]$ patterns
                     flexible_pattern = r'\[[^@\]]+(@[^\]]+)?\][$#]\s*$'
                     pattern = re.compile(flexible_pattern)
-                    logger.debug(f"Using flexible bracketed pattern: {flexible_pattern}")
                 else:
                     escaped = re.escape(fallback)
                     pattern = re.compile(rf"{escaped}\s*$")
-                    logger.debug(f"Using extracted prompt from output: {fallback}")
 
         # Enhanced fallback: try common prompt patterns with scoring
         if pattern is None:
-            logger.debug(f"[PATTERN_CREATE] No PS1 pattern, trying fallbacks")
-
             common_patterns = [
                 # Network device prompts (more specific first)
                 r'\([^)]+\)\s*[>#]\s*$',  # (hostname)> or (hostname)#
@@ -788,7 +763,6 @@ class SSHSessionManager:
             # Test patterns against initial output if available
             if initial_output:
                 clean_output = self._strip_ansi(initial_output)
-                logger.debug(f"[PATTERN_CREATE] Testing fallback patterns against: {repr(clean_output[-100:])}")
 
                 # Score patterns by specificity (longer match = more specific)
                 pattern_scores = []
@@ -799,31 +773,21 @@ class SSHSessionManager:
                         # Score based on matched text length (more specific = higher score)
                         score = len(match.group(0))
                         pattern_scores.append((score, i, test_pattern, p))
-                        logger.debug(f"Pattern {i} matched with score {score}: {p}")
-                    else:
-                        logger.debug(f"Pattern {i} failed: {p}")
 
                 if pattern_scores:
                     # Use most specific (highest score) pattern
                     score, best_idx, pattern, pattern_str = max(pattern_scores)
-                    logger.debug(f"Using most specific pattern {best_idx} (score={score}): {pattern_str}")
-                else:
-                    logger.debug("No patterns matched")
 
             # Final fallback if no pattern matched
             if pattern is None:
                 pattern = re.compile(r"[>#\$]\s*$")
-                logger.debug("Using generic prompt pattern")
 
-        logger.debug(f"[PATTERN_CREATE] Final pattern for {session_key}: {pattern.pattern}")
         self._session_prompt_patterns[session_key] = pattern
         self._prompt_miss_count[session_key] = 0  # Reset miss count
         return pattern
 
     def _convert_ps1_to_pattern(self, prompt: str, logger) -> re.Pattern:
         """Convert PS1 prompt string to regex pattern."""
-        logger.debug(f"[PATTERN_CREATE] Converting PS1: {prompt}")
-
         # Convert PS1 variables to flexible regex patterns
         pattern_str = prompt
         pattern_str = pattern_str.replace('\\u', '[^@\\s]+')  # username
@@ -833,8 +797,6 @@ class SSHSessionManager:
         pattern_str = pattern_str.replace('\\w', '[^\\]\\s]*')   # full working dir
         pattern_str = pattern_str.replace('\\$', '[$#]')     # $ or #
 
-        logger.debug(f"[PATTERN_CREATE] After PS1 conversion: {pattern_str}")
-
         # Now escape special regex chars, but preserve our bracket patterns
         # First mark our patterns to protect them
         pattern_str = pattern_str.replace('[^@\\s]+', '___USERNAME___')
@@ -842,12 +804,8 @@ class SSHSessionManager:
         pattern_str = pattern_str.replace('[^\\]\\s]*', '___DIRNAME___')
         pattern_str = pattern_str.replace('[$#]', '___PROMPT___')
 
-        logger.debug(f"[PATTERN_CREATE] After marking: {pattern_str}")
-
         # Escape everything else
         pattern_str = re.escape(pattern_str)
-
-        logger.debug(f"[PATTERN_CREATE] After escaping: {pattern_str}")
 
         # Restore our patterns
         pattern_str = pattern_str.replace('___USERNAME___', '[^@\\s]+')
@@ -856,7 +814,6 @@ class SSHSessionManager:
         pattern_str = pattern_str.replace('___PROMPT___', '[$#]')
 
         pattern = re.compile(rf"{pattern_str}\s*$")
-        logger.debug(f"Detected PS1 prompt: {prompt} -> pattern: {pattern_str}")
         return pattern
 
     @staticmethod
@@ -920,54 +877,90 @@ class SSHSessionManager:
 
     def _execute_sudo_command_internal(self, client: paramiko.SSHClient, command: str,
                                        sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
-        """Execute a sudo command, handling password prompts and output limiting."""
+        """Execute a sudo command using the persistent shell, handling password prompts.
+
+        Uses the persistent shell from the session to maintain state and benefit from
+        prompt detection.
+        """
         logger = self.logger.getChild('sudo_command')
-        shell = None
+
+        # Get session key for this client
+        # We need to derive the session key from the client
+        # Find the session key that matches this client
+        session_key = None
+        with self._lock:
+            for key, sess_client in self._sessions.items():
+                if sess_client == client:
+                    session_key = key
+                    break
+
+        if not session_key:
+            logger.error("Could not find session key for client")
+            return "", "Could not find session for sudo command", 1
 
         try:
             timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
+
+            # Ensure command starts with sudo
             if not command.strip().startswith('sudo'):
                 command = f"sudo {command}"
 
-            shell = client.invoke_shell()
+            # Get the persistent shell
+            shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
-            time.sleep(0.5)
 
-            if shell.recv_ready():
-                _ = shell.recv(4096)
-
+            # Send the command
             shell.send(command + '\n')
             time.sleep(0.5)
 
             output_limiter = OutputLimiter()
-            output = ""
+            raw_output = ""
             password_sent = False
             start_time = time.time()
+            last_recv_time = start_time
+            idle_timeout = 2.0
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    output += limited_chunk
+                    raw_output += limited_chunk
 
-                    if not password_sent and re.search(r'password', chunk, re.IGNORECASE):
+                    # Check for password prompt
+                    if not password_sent and re.search(r'\[sudo\] password|password for', raw_output, re.IGNORECASE):
+                        logger.debug("Detected sudo password prompt, sending password")
                         shell.send(f"{sudo_password}\n")
                         password_sent = True
                         time.sleep(0.3)
                         continue
 
                     if not should_continue:
-                        return output, f"Output truncated at {output_limiter.max_size} bytes", 124
+                        return raw_output, f"Output truncated at {output_limiter.max_size} bytes", 124
 
-                    if password_sent and ('#' in chunk or '$' in chunk):
-                        time.sleep(0.3)
-                        break
+                    # Check for command completion using prompt detection
+                    clean_output = self._strip_ansi(raw_output)
+                    is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+
+                    if is_complete:
+                        logger.debug("Sudo command completed (prompt detected)")
+                        return cleaned_output, "", 0
                 else:
-                    time.sleep(0.1)
-            else:
-                return output, f"Command timed out after {timeout} seconds", 124
+                    # Check idle timeout
+                    if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        logger.debug("Sudo command idle timeout, checking completion")
+                        clean_output = self._strip_ansi(raw_output)
+                        is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                        if is_complete:
+                            logger.debug("Sudo command completed (idle timeout)")
+                            return cleaned_output, "", 0
+                        # If not complete but idle, wait a bit more
 
-            return output.strip(), "", 0
+                    time.sleep(0.1)
+
+            # Timeout reached
+            logger.warning(f"Sudo command timed out after {timeout}s")
+            return raw_output.strip(), f"Command timed out after {timeout} seconds", 124
 
         except paramiko.SSHException as exc:
             logger.error(f"SSH error during sudo command: {exc}")
@@ -975,12 +968,6 @@ class SSHSessionManager:
         except Exception as exc:
             logger.error(f"Error executing sudo command: {exc}", exc_info=True)
             return "", f"Error executing sudo command: {exc}", 1
-        finally:
-            if shell:
-                try:
-                    shell.close()
-                except Exception:
-                    pass
 
     def _execute_sudo_command(self, client: paramiko.SSHClient, command: str,
                                sudo_password: str, timeout: int = 30) -> tuple[str, str, int]:
@@ -1007,27 +994,32 @@ class SSHSessionManager:
         # Strategy 1: Check for captured literal/generalized prompt (most reliable)
         if session_key in self._session_prompts:
             literal_prompt = self._session_prompts[session_key]
-            logger.debug(f"[PROMPT_CHECK] Checking for prompt: {repr(literal_prompt)}")
 
-            # Check if prompt contains wildcards (generalized)
-            if '*' in literal_prompt:
+            # Check if prompt contains wildcards or character classes (generalized)
+            if '*' in literal_prompt or '[' in literal_prompt:
                 # Convert to pattern for wildcard matching
-                # Escape special regex chars except *
+                # Escape special regex chars except * and []
                 pattern_str = re.escape(literal_prompt).replace(r'\*', '.*?')
+                # Un-escape character classes like [>#]
+                pattern_str = pattern_str.replace(r'\[', '[').replace(r'\]', ']')
                 # Ensure it matches at end of output
                 pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
-                logger.debug(f"[PROMPT_CHECK] Using wildcard pattern: {pattern.pattern}")
+
+                # Debug: show what we're matching against
+                last_100 = clean_output.rstrip()[-100:] if len(clean_output) > 100 else clean_output.rstrip()
+                logger.debug(f"Checking wildcard pattern '{literal_prompt}' (regex: '{pattern.pattern}') against last 100 chars: {repr(last_100)}")
 
                 match = pattern.search(clean_output.rstrip())
                 if match:
-                    logger.debug(f"[PROMPT_CHECK] Found wildcard prompt match!")
                     # Remove the matched prompt from output
                     output = clean_output[:match.start()].rstrip()
+                    logger.debug(f"Wildcard pattern matched! Matched text: {repr(match.group())}")
                     return True, output
+                else:
+                    logger.debug(f"Wildcard pattern did not match")
             else:
                 # Exact literal match
                 if clean_output.rstrip().endswith(literal_prompt):
-                    logger.debug(f"[PROMPT_CHECK] Found literal prompt match!")
                     # Remove the prompt from output
                     output = clean_output.rstrip()
                     if output.endswith(literal_prompt):
@@ -1037,15 +1029,11 @@ class SSHSessionManager:
         # Strategy 2: Fall back to pattern matching
         if session_key in self._session_prompt_patterns:
             prompt_pattern = self._session_prompt_patterns[session_key]
-            logger.debug(f"[PROMPT_CHECK] Checking pattern: {prompt_pattern.pattern}")
 
             if prompt_pattern.search(clean_output):
-                logger.debug(f"[PROMPT_CHECK] Pattern matched!")
                 output = prompt_pattern.sub('', clean_output).rstrip()
                 return True, output
 
-        logger.debug(f"[PROMPT_CHECK] No prompt match found")
-        logger.debug(f"[PROMPT_CHECK] Clean output last 100 chars: {repr(clean_output[-100:])}")
         return False, clean_output
 
     def _detect_awaiting_input(self, output: str) -> Optional[str]:
@@ -1171,17 +1159,22 @@ class SSHSessionManager:
                     awaiting = self._detect_awaiting_input(raw_output)
                     if awaiting:
                         logger.info(f"Detected interactive prompt: {awaiting}")
+                        # Automatically handle pagers by sending 'q' to quit
+                        if awaiting == "pager":
+                            logger.info("Automatically handling pager - sending 'q' to quit")
+                            shell.send('q')
+                            # Continue collecting output after quitting pager
+                            time.sleep(0.3)
+                            continue
+                        # For other types of input (password, etc.), return and let agent handle
                         return raw_output, "", 0, awaiting
 
                     # Check for command completion using captured prompt or pattern
                     clean_output = self._strip_ansi(raw_output)
-                    logger.debug(f"[PROMPT_CHECK] Raw output last 200 chars: {repr(raw_output[-200:])}")
-                    logger.debug(f"[PROMPT_CHECK] Clean output last 200 chars: {repr(clean_output[-200:])}")
 
                     is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
 
                     if is_complete:
-                        logger.debug(f"Command complete - prompt detected")
                         # Reset miss count on successful match
                         self._prompt_miss_count[session_key] = 0
                         consecutive_misses = 0
@@ -1195,7 +1188,6 @@ class SSHSessionManager:
 
                         return cleaned_output, "", 0, None
                     else:
-                        logger.debug(f"[PROMPT_CHECK] No prompt match found")
                         consecutive_misses += 1
 
                         # If we've had too many consecutive misses, try recapturing the prompt
@@ -1216,14 +1208,21 @@ class SSHSessionManager:
                 else:
                     # No data available - check if we should timeout from inactivity
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
-                        logger.debug(f"Idle timeout after {idle_timeout}s - cleaning and returning output")
                         clean_output = self._strip_ansi(raw_output)
-                        logger.debug(f"Cleaned output last 100 chars: {repr(clean_output[-100:])}")
 
                         # Check for interactive prompts BEFORE checking for completion
                         awaiting = self._detect_awaiting_input(raw_output)
                         if awaiting:
                             logger.info(f"Detected interactive prompt during idle timeout: {awaiting}")
+                            # Automatically handle pagers by sending 'q' to quit
+                            if awaiting == "pager":
+                                logger.info("Automatically handling pager during idle timeout - sending 'q' to quit")
+                                shell.send('q')
+                                # Reset idle timer and continue collecting
+                                last_recv_time = time.time()
+                                time.sleep(0.3)
+                                continue
+                            # For other types of input (password, etc.), return and let agent handle
                             return raw_output, "", 0, awaiting
 
                         # Try one more prompt check on cleaned output
@@ -1260,71 +1259,76 @@ class SSHSessionManager:
     def _execute_enable_mode_command_internal(self, client: paramiko.SSHClient, session_key: str,
                                               command: str, enable_password: str,
                                               enable_command: str, timeout: int) -> tuple[str, str, int]:
-        """Execute a command while the session is in enable mode."""
+        """Execute a command while the session is in enable mode using the persistent shell."""
         logger = self.logger.getChild('enable_mode_command')
 
-        shell = None
-        if not self._enable_mode.get(session_key, False):
-            success, result = self._enter_enable_mode(session_key, client, enable_password, enable_command)
-            if not success:
-                return "", f"Failed to enter enable mode: {result}", 1
-            shell, _ = result
-        else:
-            shell = client.invoke_shell()
-            time.sleep(0.5)
+        try:
+            # Enter enable mode if not already in it
+            if not self._enable_mode.get(session_key, False):
+                success, message = self._enter_enable_mode(session_key, client, enable_password, enable_command)
+                if not success:
+                    return "", f"Failed to enter enable mode: {message}", 1
+
+            # Get the persistent shell for this session
+            shell = self._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            # Clear any pending output
             if shell.recv_ready():
                 shell.recv(4096)
 
-        try:
-            shell.settimeout(timeout)
+            # Send the command
             shell.send(f"{command}\n")
             time.sleep(0.5)
 
             output_limiter = OutputLimiter()
-            output = ""
+            raw_output = ""
             start_time = time.time()
+            last_output_time = time.time()
+            idle_timeout = 2.0  # Consider command complete after 2 seconds of no output
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    output += limited_chunk
+                    raw_output += limited_chunk
+                    last_output_time = time.time()
 
                     if not should_continue:
                         break
 
-                    if output.strip().endswith(('#', '>')):
-                        time.sleep(0.5)
-                        if shell.recv_ready():
-                            more_chunk = shell.recv(4096).decode('utf-8', errors='ignore')
-                            limited_more, _ = output_limiter.add_chunk(more_chunk)
-                            output += limited_more
+                    # Use proper prompt detection instead of naive character checking
+                    clean_output = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', raw_output)
+                    is_complete, _ = self._check_prompt_completion(session_key, raw_output, clean_output)
+                    if is_complete:
+                        logger.debug("Prompt detected - command complete")
                         break
                 else:
+                    # No data available - check if we've been idle long enough
+                    if time.time() - last_output_time >= idle_timeout and raw_output:
+                        logger.debug(f"Idle timeout reached after {idle_timeout}s - command appears complete")
+                        break
                     time.sleep(0.1)
             else:
-                return output, f"Command timed out after {timeout} seconds", 124
+                return raw_output, f"Command timed out after {timeout} seconds", 124
 
-            lines = output.split('\n')
-            if len(lines) > 1:
-                cleaned_lines = []
-                for line in lines[1:]:
-                    stripped = line.strip()
-                    if stripped and not stripped.endswith(('#', '>')):
-                        cleaned_lines.append(stripped)
-                output = '\n'.join(cleaned_lines).strip()
+            # Clean up the output using proper prompt detection
+            clean_output = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', raw_output)
+            is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+
+            # Remove the command echo (first line)
+            lines = cleaned_output.split('\n')
+            if len(lines) > 1 and lines[0].strip() in command:
+                # First line is command echo, skip it
+                output = '\n'.join(lines[1:]).strip()
+            else:
+                output = cleaned_output.strip()
 
             return output, "", 0
 
         except Exception as exc:
             logger.error(f"Enable mode command error: {exc}", exc_info=True)
             return "", f"Error executing enable mode command: {exc}", 1
-        finally:
-            try:
-                if shell:
-                    shell.close()
-            except Exception:
-                pass
 
     def send_input_by_session(self, host: str, input_text: str, username: Optional[str] = None,
                               port: Optional[int] = None) -> tuple[bool, str, str]:

@@ -7,9 +7,23 @@ from mcp_ssh_session.session_manager import SSHSessionManager
 # Configure logging to see what's happening during tests
 logging.basicConfig(level=logging.DEBUG)
 
+def _is_network_device(host):
+    """Check if a host appears to be a network device rather than Unix/Linux."""
+    # This is a simple heuristic - you may want to make it more sophisticated
+    # Network devices often have names like router, switch, fw, etc.
+    if not host:
+        return False
+    host_lower = host.lower()
+    network_indicators = ['router', 'switch', 'sw', 'fw', 'firewall', 'gw', 'gateway', 'ap']
+    return any(indicator in host_lower for indicator in network_indicators)
+
 @pytest.mark.skipif(
     not os.environ.get("SSH_TEST_HOST"),
     reason="Skipping integration tests: SSH_TEST_HOST not set"
+)
+@pytest.mark.skipif(
+    _is_network_device(os.environ.get("SSH_TEST_HOST")),
+    reason="Skipping Unix/Linux integration tests: host appears to be a network device. Use test_network_devices.py instead."
 )
 class TestSSHIntegration:
     @pytest.fixture(scope="class")
@@ -25,7 +39,9 @@ class TestSSHIntegration:
         password = os.environ.get("SSH_TEST_PASSWORD")
         key_filename = os.environ.get("SSH_TEST_KEY_FILE")
         port = int(os.environ.get("SSH_TEST_PORT", "22"))
-        
+
+        print(f"\n[DEBUG] Test config - host: {repr(host)}, username: {repr(username)}, port: {port}")
+
         return {
             "host": host,
             "username": username,
@@ -188,40 +204,108 @@ class TestSSHIntegration:
     def test_streaming_async_output(self, session_manager, ssh_config):
         """Test that we can see intermediate output from a running async command."""
         command = "for i in {1..3}; do echo \"Step $i\"; sleep 1; done"
-        
+
         # Start async command
         command_id = session_manager.execute_command_async(
             host=ssh_config['host'],
             command=command,
             timeout=10
         )
-        
+
         print(f"Started async command {command_id}")
-        
+
         # Poll a few times to check for streaming output
         full_output = ""
         completed = False
         start_time = time.time()
-        
+
         while time.time() - start_time < 10:
             status = session_manager.get_command_status(command_id)
-            
+
             if status['stdout']:
                 print(f"Current stdout: {status['stdout'].strip()}")
                 full_output = status['stdout']
-            
+
             if "Step 1" in full_output and not completed:
                 # We saw the first step while it might still be running (or just finished)
                 pass
-                
+
             if status['status'] != 'running':
                 completed = True
                 break
-            
+
             time.sleep(0.5)
-            
+
         assert completed
         assert "Step 1" in full_output
         assert "Step 2" in full_output
         assert "Step 3" in full_output
         assert status['exit_code'] == 0
+
+    @pytest.mark.skipif(
+        not os.environ.get("SSH_TEST_SUDO_PASSWORD"),
+        reason="Skipping sudo test: SSH_TEST_SUDO_PASSWORD not set"
+    )
+    def test_sudo_with_password(self, session_manager, ssh_config):
+        """Test sudo command with automatic password handling."""
+        sudo_password = os.environ.get("SSH_TEST_SUDO_PASSWORD")
+
+        # Create a test file that requires sudo to write
+        stdout, stderr, exit_code = session_manager.execute_command(
+            host=ssh_config['host'],
+            username=ssh_config['username'],
+            password=ssh_config['password'],
+            key_filename=ssh_config['key_filename'],
+            port=ssh_config['port'],
+            sudo_password=sudo_password,
+            command="whoami",
+            timeout=10
+        )
+
+        print(f"Sudo whoami output: {stdout}")
+        assert exit_code == 0
+        assert "root" in stdout.lower()
+
+        # Test writing to a protected location
+        test_file = "/tmp/mcp_test_sudo_file.txt"
+        test_content = "sudo test content"
+
+        stdout, stderr, exit_code = session_manager.execute_command(
+            host=ssh_config['host'],
+            username=ssh_config['username'],
+            password=ssh_config['password'],
+            key_filename=ssh_config['key_filename'],
+            port=ssh_config['port'],
+            sudo_password=sudo_password,
+            command=f"echo '{test_content}' | sudo tee {test_file}",
+            timeout=10
+        )
+
+        assert exit_code == 0
+
+        # Verify the file was created
+        stdout, stderr, exit_code = session_manager.execute_command(
+            host=ssh_config['host'],
+            username=ssh_config['username'],
+            password=ssh_config['password'],
+            key_filename=ssh_config['key_filename'],
+            port=ssh_config['port'],
+            sudo_password=sudo_password,
+            command=f"sudo cat {test_file}",
+            timeout=10
+        )
+
+        assert exit_code == 0
+        assert test_content in stdout
+
+        # Cleanup
+        session_manager.execute_command(
+            host=ssh_config['host'],
+            username=ssh_config['username'],
+            password=ssh_config['password'],
+            key_filename=ssh_config['key_filename'],
+            port=ssh_config['port'],
+            sudo_password=sudo_password,
+            command=f"sudo rm {test_file}",
+            timeout=10
+        )
