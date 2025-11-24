@@ -1042,30 +1042,36 @@ class SSHSessionManager:
         Returns string describing what input is needed, or None if not awaiting input.
         """
         # Common password prompts - match various formats like "password:", "password for user:", etc.
-        if re.search(r'password[^:]*:?\s*$', output, re.IGNORECASE | re.MULTILINE):
+        # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
+        # We also exclude newlines, =, ", and ' from the wildcard to prevent matching 
+        # across lines, URL parameters, or JSON keys
+        if re.search(r'password[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
             return "password"
-        if re.search(r'passphrase[^:]*:?\s*$', output, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'passphrase[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
             return "passphrase"
 
         # Pager prompts (less, more, MikroTik)
-        if re.search(r'^\s*\(END\)\s*$|^\s*:\s*$', output, re.MULTILINE):
+        # Match (END) or : on the last line
+        if re.search(r'(?:^|[\r\n])\s*\(END\)\s*$', output):
+            return "pager"
+        if re.search(r'(?:^|[\r\n])\s*:\s*$', output):
             return "pager"
 
         # MikroTik pager prompt
-        if re.search(r'--\s*\[Q quit\|D dump\|.*?\]\s*$', output, re.MULTILINE):
+        if re.search(r'--\s*\[Q quit\|D dump\|.*?\]\s*$', output):
             return "pager"
 
         # Yes/no prompts
         if re.search(r'\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$',
-                     output, re.IGNORECASE | re.MULTILINE):
+                     output, re.IGNORECASE):
             return "yes_no"
 
         # Press any key / continue
-        if re.search(r'press any key|press enter|to continue', output, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'(?:press any key|press enter|to continue)[:\.]*\s*$', output, re.IGNORECASE):
             return "press_key"
 
         # Generic prompt at end (anything ending with ? or prompt-like)
-        if re.search(r'\?\s*$|-->?\s*$|enter [a-z\s]+[:\s]*$', output, re.IGNORECASE | re.MULTILINE):
+        if re.search(r'(?:\?|-->|enter [a-z\s]+[:\s]*)$', output, re.IGNORECASE):
             return "user_input"
 
         return None
