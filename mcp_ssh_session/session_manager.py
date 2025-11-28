@@ -938,6 +938,12 @@ class SSHSessionManager:
                     if not should_continue:
                         return raw_output, f"Output truncated at {output_limiter.max_size} bytes", 124
 
+                    # Check for interactive prompts (SSH host key, etc.) BEFORE checking completion
+                    awaiting = self._detect_awaiting_input(raw_output)
+                    if awaiting:
+                        logger.info(f"Sudo command waiting for input: {awaiting}")
+                        return raw_output, f"Command requires input: {awaiting}", 1
+
                     # Check for command completion using prompt detection
                     clean_output = self._strip_ansi(raw_output)
                     is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
@@ -948,6 +954,12 @@ class SSHSessionManager:
                 else:
                     # Check idle timeout
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        # Check for interactive prompts during idle
+                        awaiting = self._detect_awaiting_input(raw_output)
+                        if awaiting:
+                            logger.info(f"Sudo command waiting for input (idle): {awaiting}")
+                            return raw_output, f"Command requires input: {awaiting}", 1
+
                         logger.debug("Sudo command idle timeout, checking completion")
                         clean_output = self._strip_ansi(raw_output)
                         is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
@@ -1060,6 +1072,10 @@ class SSHSessionManager:
         # MikroTik pager prompt
         if re.search(r'--\s*\[Q quit\|D dump\|.*?\]\s*$', output):
             return "pager"
+
+        # SSH host key confirmation
+        if re.search(r'Are you sure you want to continue connecting.*\(yes/no', output, re.IGNORECASE):
+            return "ssh_host_key"
 
         # Yes/no prompts
         if re.search(r'\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$',
