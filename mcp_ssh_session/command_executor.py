@@ -415,10 +415,16 @@ class CommandExecutor:
             return result
 
     def shutdown(self):
-        """Shut down the underlying thread pool executor."""
+        """Shut down the underlying thread pool executor and clear running commands."""
         logger = self.logger.getChild('shutdown')
         logger.info("Shutting down command executor pool")
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+        with self._lock:
+            running_count = sum(1 for cmd in self._commands.values() if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT))
+            if running_count > 0:
+                logger.info(f"Clearing {running_count} active commands from the registry due to shutdown.")
+            self._commands.clear()
 
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,
                                            timeout: int, session_key: str) -> tuple[str, str, int]:
