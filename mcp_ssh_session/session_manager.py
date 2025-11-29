@@ -356,13 +356,6 @@ class SSHSessionManager:
 
         logger.info("All sessions closed.")
 
-        # Shutdown the executor managed by CommandExecutor
-        logger.info("Shutting down command executor pool.")
-        try:
-            self.command_executor.shutdown()
-        except Exception as e:
-            logger.error(f"Error shutting down executor: {e}", exc_info=True)
-
     def __del__(self):
         """Cleanup when the session manager is destroyed."""
         logger = self.logger.getChild('destructor')
@@ -371,6 +364,12 @@ class SSHSessionManager:
             self.close_all_sessions()
         except Exception as e:
             logger.error(f"Error during __del__ cleanup: {e}", exc_info=True)
+        
+        # Shutdown the executor when manager is destroyed
+        try:
+            self.command_executor.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down executor: {e}", exc_info=True)
 
     def list_sessions(self) -> list[str]:
         """List all active session keys."""
