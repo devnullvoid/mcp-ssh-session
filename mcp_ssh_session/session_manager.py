@@ -297,6 +297,10 @@ class SSHSessionManager:
         logger = self.logger.getChild('internal_close')
         logger.debug(f"Closing session resources for {session_key}")
 
+        # Clear any commands for this session first
+        logger.debug(f"Clearing commands for {session_key}")
+        self.command_executor.clear_session_commands(session_key)
+
         # Close persistent shell if exists
         if session_key in self._session_shells:
             logger.debug(f"Closing persistent shell for {session_key}")
@@ -331,6 +335,10 @@ class SSHSessionManager:
         logger = self.logger.getChild('close_all')
         logger.info("Closing all active sessions and resources.")
         with self._lock:
+            # Clear all commands first
+            logger.debug("Clearing all commands")
+            self.command_executor.clear_all_commands()
+
             # Close all persistent shells
             logger.debug(f"Closing {len(self._session_shells)} persistent shells.")
             for key, shell in self._session_shells.items():
@@ -422,6 +430,17 @@ class SSHSessionManager:
         # Build device profile from shell output instead of exec_command
         self._build_device_profile(session_key, initial_output)
 
+        # For non-POSIX Unix shells, start bash to avoid compatibility issues
+        device_type = self._session_shell_types.get(session_key, 'unknown')
+        if device_type == 'unix_shell':
+            # Detect non-POSIX shells (fish, nushell, elvish, etc.)
+            if any(indicator in initial_output.lower() for indicator in ['fish', 'nushell', 'elvish', 'xonsh']):
+                logger.info(f"Detected non-POSIX shell, starting bash for {session_key}")
+                shell.send('bash\n')
+                time.sleep(0.5)
+                if shell.recv_ready():
+                    shell.recv(4096)  # Clear bash startup output
+
         # Capture the actual prompt for this session
         self._capture_prompt(session_key, shell)
 
@@ -458,8 +477,8 @@ class SSHSessionManager:
                 device_type = 'vyos'
             elif 'openwrt' in output_lower or 'lede' in output_lower:
                 device_type = 'openwrt'
-            # Unix/Linux shells
-            elif any(prompt in initial_output for prompt in ['$', '#']):
+            # Unix/Linux shells - check for shell indicators or prompt characters
+            elif any(indicator in output_lower for indicator in ['fish', 'bash', 'zsh', 'ubuntu', 'debian', 'centos', 'redhat', 'fedora', 'linux', 'bsd']) or any(prompt in initial_output for prompt in ['$', '#', '❯']):
                 device_type = 'unix_shell'
             # Generic network device fallback
             elif any(keyword in output_lower for keyword in ['switch', 'router', 'firewall', 'gateway']):
@@ -1191,9 +1210,13 @@ class SSHSessionManager:
                         return raw_output, "", 0, awaiting
 
                     # Check for command completion using captured prompt or pattern
-                    clean_output = self._strip_ansi(raw_output)
-
-                    is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                    # Only check after brief idle to avoid false positives from command echo
+                    if (time.time() - last_recv_time) > 0.2:
+                        clean_output = self._strip_ansi(raw_output)
+                        is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
+                    else:
+                        is_complete = False
+                        cleaned_output = ""
 
                     if is_complete:
                         # Reset miss count on successful match
@@ -1246,7 +1269,7 @@ class SSHSessionManager:
                             # For other types of input (password, etc.), return and let agent handle
                             return raw_output, "", 0, awaiting
 
-                        # Try one more prompt check on cleaned output
+                        # Only complete on idle timeout if we detect a prompt
                         is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
                         if is_complete:
                             logger.debug("Prompt found in cleaned output during idle timeout")

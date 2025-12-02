@@ -90,7 +90,7 @@ class CommandExecutor:
         # If we reach here, the command genuinely timed out based on the outer `timeout` parameter.
         logger.warning(f"[EXEC_TIMEOUT] Command {command_id} timed out after {timeout}s")
         status_on_timeout = self.get_command_status(command_id)
-        return status_on_timeout.get('stdout', ''), f"Command timed out after {timeout} seconds", 124
+        return status_on_timeout.get('stdout', ''), f"ASYNC:{command_id}", 124
 
     def execute_command_async(self, host: str, username: Optional[str] = None,
                              command: str = "", password: Optional[str] = None,
@@ -192,6 +192,26 @@ class CommandExecutor:
                 )
 
             logger.debug(f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}, awaiting_input={awaiting_input_reason}")
+
+            # Handle timeout case - command is still running on remote shell
+            if exit_code == 124 and not awaiting_input_reason:
+                logger.warning(f"Command {command_id} timed out after {timeout}s, continuing to monitor in background")
+                with self._lock:
+                    if command_id in self._commands:
+                        running_cmd.stdout = stdout
+                        running_cmd.stderr = f"Command exceeded {timeout}s timeout, still running..."
+                        running_cmd.exit_code = None  # Clear exit code since it's still running
+                        # Keep status as RUNNING
+                        logger.info(f"Command {command_id} still running after timeout, submitting background monitor")
+
+                # Continue monitoring in background
+                self._executor.submit(
+                    self._continue_monitoring_timeout_background,
+                    command_id, running_cmd, session_key, timeout_occurred_at=time.time()
+                )
+                return
+
+            # Normal completion or awaiting input
             with self._lock:
                 if command_id in self._commands:
                     running_cmd.stdout = stdout
@@ -320,6 +340,106 @@ class CommandExecutor:
                 logger.error(f"Failed to send input: {e}", exc_info=True)
                 return False, "", f"Failed to send input: {e}"
 
+    def _continue_monitoring_timeout_background(self, command_id: str, cmd: Any,
+                                                session_key: str, timeout_occurred_at: float) -> None:
+        """Background task to monitor shell output after a timeout occurred.
+
+        Continues monitoring the shell until command actually completes.
+        This prevents premature completion when commands take longer than the timeout.
+        """
+        logger = self.logger.getChild('timeout_monitor_bg')
+        logger.info(f"[TIMEOUT_MONITOR_START] command_id={command_id}")
+
+        idle_timeout = 2.0
+        last_recv_time = time.time()
+        start_time = time.time()
+        max_additional_timeout = 300  # Max 5 minutes additional after initial timeout
+
+        try:
+            while time.time() - start_time < max_additional_timeout:
+                try:
+                    # Check if command was interrupted/cancelled
+                    with self._lock:
+                        if command_id not in self._commands:
+                            logger.info(f"[TIMEOUT_MONITOR_CANCELLED] Command {command_id} removed from registry")
+                            return
+                        if cmd.status == CommandStatus.INTERRUPTED:
+                            logger.info(f"[TIMEOUT_MONITOR_INTERRUPTED] Command {command_id} was interrupted")
+                            return
+
+                    if cmd.shell.recv_ready():
+                        chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
+                        if chunk:
+                            with self._lock:
+                                if command_id in self._commands:
+                                    cmd.stdout += chunk
+                            last_recv_time = time.time()
+                            logger.debug(f"[TIMEOUT_MONITOR_RECV] Received {len(chunk)} bytes")
+
+                            # Check for interactive prompts
+                            awaiting = self._session_manager._detect_awaiting_input(cmd.stdout)
+                            if awaiting:
+                                logger.info(f"[TIMEOUT_MONITOR_AWAITING] Command awaiting input: {awaiting}")
+                                with self._lock:
+                                    if command_id in self._commands:
+                                        cmd.status = CommandStatus.AWAITING_INPUT
+                                        cmd.awaiting_input_reason = awaiting
+                                return
+
+                            # Check for prompt completion
+                            clean_output = self._session_manager._strip_ansi(cmd.stdout)
+                            is_complete, cleaned_output = self._session_manager._check_prompt_completion(
+                                session_key, cmd.stdout, clean_output
+                            )
+                            if is_complete:
+                                logger.info(f"[TIMEOUT_MONITOR_COMPLETE] Prompt detected - command complete")
+                                with self._lock:
+                                    if command_id in self._commands:
+                                        cmd.stdout = cleaned_output
+                                        cmd.status = CommandStatus.COMPLETED
+                                        cmd.exit_code = 0
+                                        cmd.end_time = datetime.now()
+                                return
+                    else:
+                        # No data available - check if we've been idle long enough
+                        elapsed_idle = time.time() - last_recv_time
+                        if elapsed_idle > idle_timeout and cmd.stdout:
+                            # Check one more time for prompt
+                            clean_output = self._session_manager._strip_ansi(cmd.stdout)
+                            is_complete, cleaned_output = self._session_manager._check_prompt_completion(
+                                session_key, cmd.stdout, clean_output
+                            )
+                            if is_complete:
+                                logger.info(f"[TIMEOUT_MONITOR_IDLE_COMPLETE] Idle timeout with prompt - command complete")
+                                with self._lock:
+                                    if command_id in self._commands:
+                                        cmd.stdout = cleaned_output
+                                        cmd.status = CommandStatus.COMPLETED
+                                        cmd.exit_code = 0
+                                        cmd.end_time = datetime.now()
+                                return
+
+                        time.sleep(0.1)
+                except Exception as recv_error:
+                    logger.error(f"[TIMEOUT_MONITOR_RECV_ERROR] Error receiving data: {recv_error}")
+                    break
+        except Exception as e:
+            logger.error(f"[TIMEOUT_MONITOR_ERROR] Error in timeout monitoring: {e}", exc_info=True)
+            with self._lock:
+                if command_id in self._commands:
+                    cmd.status = CommandStatus.FAILED
+                    cmd.stderr = f"Error during background monitoring: {e}"
+                    cmd.end_time = datetime.now()
+
+        # If we reached max timeout, mark as completed with what we have
+        logger.warning(f"[TIMEOUT_MONITOR_MAX] Command {command_id} reached max monitoring time")
+        with self._lock:
+            if command_id in self._commands and cmd.status == CommandStatus.RUNNING:
+                cmd.status = CommandStatus.COMPLETED
+                cmd.exit_code = 124
+                cmd.stderr = f"Command exceeded maximum monitoring time ({max_additional_timeout}s after initial timeout)"
+                cmd.end_time = datetime.now()
+
     def _continue_monitoring_shell_background(self, command_id: str, cmd: Any) -> None:
         """Background task to monitor shell output after input has been sent.
 
@@ -413,6 +533,49 @@ class CommandExecutor:
             result = completed[:limit]
             logger.info(f"Returning {len(result)} commands from history (limit: {limit}).")
             return result
+
+    def clear_session_commands(self, session_key: str):
+        """Clear all commands for a specific session.
+
+        Args:
+            session_key: Session identifier (e.g., "user@host:22")
+        """
+        logger = self.logger.getChild('clear_session_commands')
+        with self._lock:
+            commands_to_remove = [
+                cmd_id for cmd_id, cmd in self._commands.items()
+                if cmd.session_key == session_key
+            ]
+
+            if commands_to_remove:
+                logger.info(f"Clearing {len(commands_to_remove)} commands for session {session_key}")
+                for cmd_id in commands_to_remove:
+                    cmd = self._commands[cmd_id]
+                    # Mark as interrupted if still running/awaiting
+                    if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
+                        cmd.status = CommandStatus.INTERRUPTED
+                        cmd.end_time = datetime.now()
+                        logger.debug(f"Marked command {cmd_id} as interrupted")
+                    del self._commands[cmd_id]
+                logger.info(f"Cleared {len(commands_to_remove)} commands for session {session_key}")
+            else:
+                logger.debug(f"No commands found for session {session_key}")
+
+    def clear_all_commands(self):
+        """Clear all commands from all sessions."""
+        logger = self.logger.getChild('clear_all_commands')
+        with self._lock:
+            count = len(self._commands)
+            if count > 0:
+                logger.info(f"Clearing {count} commands from all sessions")
+                for cmd in self._commands.values():
+                    if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
+                        cmd.status = CommandStatus.INTERRUPTED
+                        cmd.end_time = datetime.now()
+                self._commands.clear()
+                logger.info(f"Cleared {count} commands")
+            else:
+                logger.debug("No commands to clear")
 
     def shutdown(self):
         """Shut down the underlying thread pool executor and clear running commands."""
