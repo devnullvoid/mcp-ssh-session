@@ -669,12 +669,13 @@ class SSHSessionManager:
 
         # Pattern 4: Simple prompts with just directory before prompt char
         # ~/dir$ -> *$ or /path$ -> *$
-        if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
-            match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
-            if match:
-                prompt_char = match.group(2)
-                generalized = '*' + prompt_char
-                return generalized
+        # DISABLED: Too dangerous, matches any output ending in prompt char
+        # if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
+        #     match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
+        #     if match:
+        #         prompt_char = match.group(2)
+        #         generalized = '*' + prompt_char
+        #         return generalized
 
         # No generalization needed
         return prompt
@@ -937,11 +938,14 @@ class SSHSessionManager:
             start_time = time.time()
             last_recv_time = start_time
             idle_timeout = 2.0
+            max_idle_checks = 50  # Max 5 seconds of idle checking (50 * 0.1s)
+            idle_check_count = 0
 
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='ignore')
                     last_recv_time = time.time()
+                    idle_check_count = 0  # Reset idle check counter on new data
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
 
@@ -972,6 +976,13 @@ class SSHSessionManager:
                 else:
                     # Check idle timeout
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
+                        idle_check_count += 1
+                        
+                        # If we've been idle-checking too long without finding a prompt, break
+                        if idle_check_count > max_idle_checks:
+                            logger.warning(f"Sudo command exceeded max idle checks ({max_idle_checks}), assuming still running")
+                            break
+                        
                         # Check for interactive prompts during idle
                         awaiting = self._detect_awaiting_input(raw_output)
                         if awaiting:
@@ -1071,20 +1082,30 @@ class SSHSessionManager:
 
         Returns string describing what input is needed, or None if not awaiting input.
         """
+        logger = self.logger.getChild('awaiting_input')
+        last_100 = output[-100:] if len(output) > 100 else output
+        logger.debug(f"Checking for awaiting input, last 100 chars: {repr(last_100)}")
+        
         # Common password prompts - match various formats like "password:", "password for user:", etc.
         # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
         # We also exclude newlines, =, ", and ' from the wildcard to prevent matching 
         # across lines, URL parameters, or JSON keys
         if re.search(r'password[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+            logger.debug("Detected password prompt")
             return "password"
         if re.search(r'passphrase[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+            logger.debug("Detected passphrase prompt")
             return "passphrase"
 
         # Pager prompts (less, more, MikroTik)
-        # Match (END) or : on the last line
-        if re.search(r'(?:^|[\r\n])\s*\(END\)\s*$', output):
+        # Match (END) with optional line numbers before it, or : on the last line
+        # Strip ANSI codes from the end to properly detect pager prompts
+        clean_output = self._strip_ansi(output)
+        if re.search(r'(?:^|[\r\n]).*?\(END\)\s*$', clean_output):
+            logger.debug("Detected pager (END) prompt")
             return "pager"
-        if re.search(r'(?:^|[\r\n])\s*:\s*$', output):
+        if re.search(r'(?:^|[\r\n])\s*:\s*$', clean_output):
+            logger.debug("Detected pager : prompt")
             return "pager"
 
         # MikroTik pager prompt
@@ -1180,6 +1201,7 @@ class SSHSessionManager:
             start_time = time.time()
             last_recv_time = start_time
             idle_timeout = 2.0
+            seen_command_echo = False
             # Ensure prompt pattern exists as fallback
             self._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
@@ -1190,6 +1212,9 @@ class SSHSessionManager:
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
+
+                    if not seen_command_echo and '\n' in raw_output:
+                        seen_command_echo = True
 
                     if not should_continue:
                         logger.warning("Output limit reached")
@@ -1211,7 +1236,8 @@ class SSHSessionManager:
 
                     # Check for command completion using captured prompt or pattern
                     # Only check after brief idle to avoid false positives from command echo
-                    if (time.time() - last_recv_time) > 0.2:
+                    # AND make sure we've seen the command echo (newline)
+                    if seen_command_echo and (time.time() - last_recv_time) > 0.2:
                         clean_output = self._strip_ansi(raw_output)
                         is_complete, cleaned_output = self._check_prompt_completion(session_key, raw_output, clean_output)
                     else:
@@ -1274,14 +1300,14 @@ class SSHSessionManager:
                         if is_complete:
                             logger.debug("Prompt found in cleaned output during idle timeout")
 
-                        # If this was a context-changing command, recapture the prompt
-                        if context_changing and is_complete:
-                            logger.info(f"Recapturing prompt after context-changing command (idle timeout)")
-                            with self._lock:
-                                self._session_prompts.pop(session_key, None)
-                            self._capture_prompt(session_key, shell)
+                            # If this was a context-changing command, recapture the prompt
+                            if context_changing:
+                                logger.info(f"Recapturing prompt after context-changing command (idle timeout)")
+                                with self._lock:
+                                    self._session_prompts.pop(session_key, None)
+                                self._capture_prompt(session_key, shell)
 
-                        return cleaned_output, "", 0, None
+                            return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")

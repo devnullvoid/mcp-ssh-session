@@ -108,18 +108,9 @@ class CommandExecutor:
             host, username, port
         )
 
-        # Check if a command is already running for this session
-        with self._lock:
-            for cmd in self._commands.values():
-                if cmd.session_key == session_key and cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
-                    error_msg = (
-                        f"A command is already running or awaiting input in this session ({session_key}).\n"
-                        f"Running Command ID: {cmd.command_id}\n"
-                        f"Running Command Status: {cmd.status.value}"
-                    )
-                    logger.error(error_msg)
-                    raise Exception(error_msg)
-
+        # Prepare session and shell first (outside lock to avoid blocking)
+        # Note: This avoids race conditions where two threads check for running commands
+        # simultaneously before either registers one.
         client = self._session_manager.get_or_create_session(host, username, password, key_filename, port)
         shell = self._session_manager._get_or_create_shell(session_key, client)
 
@@ -140,7 +131,18 @@ class CommandExecutor:
             end_time=None
         )
 
+        # Atomic check and registration
         with self._lock:
+            for cmd in self._commands.values():
+                if cmd.session_key == session_key and cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
+                    error_msg = (
+                        f"A command is already running or awaiting input in this session ({session_key}).\n"
+                        f"Running Command ID: {cmd.command_id}\n"
+                        f"Running Command Status: {cmd.status.value}"
+                    )
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+
             self._commands[command_id] = running_cmd
             logger.debug(f"Registered running command {command_id}")
 
@@ -355,8 +357,18 @@ class CommandExecutor:
         start_time = time.time()
         max_additional_timeout = 300  # Max 5 minutes additional after initial timeout
 
+        # Initialize output limiter
+        output_limiter = OutputLimiter()
+        # Estimate current size
+        output_limiter.current_size = len(cmd.stdout.encode('utf-8'))
+
         try:
             while time.time() - start_time < max_additional_timeout:
+                # Check cancellation signal
+                if cmd.monitoring_cancelled.is_set():
+                    logger.info(f"[TIMEOUT_MONITOR_CANCELLED] Monitoring cancelled for {command_id}")
+                    return
+
                 try:
                     # Check if command was interrupted/cancelled
                     with self._lock:
@@ -370,9 +382,22 @@ class CommandExecutor:
                     if cmd.shell.recv_ready():
                         chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                         if chunk:
+                            # Apply output limiting
+                            chunk_to_add, should_continue = output_limiter.add_chunk(chunk)
+                            
                             with self._lock:
                                 if command_id in self._commands:
-                                    cmd.stdout += chunk
+                                    cmd.stdout += chunk_to_add
+                            
+                            if not should_continue:
+                                logger.warning(f"[TIMEOUT_MONITOR_LIMIT] Output limit reached for {command_id}")
+                                with self._lock:
+                                    if command_id in self._commands:
+                                        cmd.status = CommandStatus.FAILED
+                                        cmd.stderr += f"\nOutput limit of {output_limiter.max_size} bytes exceeded."
+                                        cmd.end_time = datetime.now()
+                                return
+
                             last_recv_time = time.time()
                             logger.debug(f"[TIMEOUT_MONITOR_RECV] Received {len(chunk)} bytes")
 
@@ -454,15 +479,38 @@ class CommandExecutor:
         start_time = time.time()
         max_timeout = 60  # Max 60 seconds to wait for completion
 
+        # Initialize output limiter
+        output_limiter = OutputLimiter()
+        # Estimate current size
+        output_limiter.current_size = len(cmd.stdout.encode('utf-8'))
+
         try:
             while time.time() - start_time < max_timeout:
+                # Check cancellation signal
+                if cmd.monitoring_cancelled.is_set():
+                    logger.info(f"[BG_MONITOR_CANCELLED] Monitoring cancelled for {command_id}")
+                    return
+
                 try:
                     if cmd.shell.recv_ready():
                         chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                         if chunk:
+                            # Apply output limiting
+                            chunk_to_add, should_continue = output_limiter.add_chunk(chunk)
+
                             with self._lock:
                                 if command_id in self._commands:
-                                    cmd.stdout += chunk
+                                    cmd.stdout += chunk_to_add
+                            
+                            if not should_continue:
+                                logger.warning(f"[BG_MONITOR_LIMIT] Output limit reached for {command_id}")
+                                with self._lock:
+                                    if command_id in self._commands:
+                                        cmd.status = CommandStatus.FAILED
+                                        cmd.stderr += f"\nOutput limit of {output_limiter.max_size} bytes exceeded."
+                                        cmd.end_time = datetime.now()
+                                return
+
                             last_recv_time = time.time()
                             logger.debug(f"[BG_MONITOR_RECV] Received {len(chunk)} bytes: {repr(chunk[:100])}")
                         else:
@@ -551,6 +599,9 @@ class CommandExecutor:
                 logger.info(f"Clearing {len(commands_to_remove)} commands for session {session_key}")
                 for cmd_id in commands_to_remove:
                     cmd = self._commands[cmd_id]
+                    # Signal cancellation to background threads
+                    cmd.monitoring_cancelled.set()
+
                     # Mark as interrupted if still running/awaiting
                     if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
                         cmd.status = CommandStatus.INTERRUPTED
@@ -569,6 +620,9 @@ class CommandExecutor:
             if count > 0:
                 logger.info(f"Clearing {count} commands from all sessions")
                 for cmd in self._commands.values():
+                    # Signal cancellation
+                    cmd.monitoring_cancelled.set()
+
                     if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
                         cmd.status = CommandStatus.INTERRUPTED
                         cmd.end_time = datetime.now()
@@ -587,6 +641,11 @@ class CommandExecutor:
             running_count = sum(1 for cmd in self._commands.values() if cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT))
             if running_count > 0:
                 logger.info(f"Clearing {running_count} active commands from the registry due to shutdown.")
+            
+            # Signal cancellation to all commands
+            for cmd in self._commands.values():
+                cmd.monitoring_cancelled.set()
+                
             self._commands.clear()
 
     def _execute_standard_command_internal(self, client: paramiko.SSHClient, command: str,

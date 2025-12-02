@@ -1,8 +1,9 @@
 """Data structures for SSH session management."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 from datetime import datetime
+import threading
 
 
 class CommandStatus(Enum):
@@ -27,3 +28,4 @@ class RunningCommand:
     start_time: datetime
     end_time: Optional[datetime]
     awaiting_input_reason: Optional[str] = None  # What is the command waiting for? (e.g., "password", "user_input")
+    monitoring_cancelled: threading.Event = field(default_factory=threading.Event)
