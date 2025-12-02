@@ -180,7 +180,11 @@ class CommandExecutor:
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
                 )
-                awaiting_input_reason = None
+                # Parse awaiting_input from stderr if present
+                if exit_code == 1 and stderr.startswith("Command requires input: "):
+                    awaiting_input_reason = stderr.replace("Command requires input: ", "")
+                else:
+                    awaiting_input_reason = None
             elif enable_password:
                 logger.debug(f"Executing in enable mode for {command_id}")
                 stdout, stderr, exit_code = self._execute_enable_mode_command_internal(
