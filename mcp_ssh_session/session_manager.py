@@ -430,19 +430,51 @@ class SSHSessionManager:
         # Build device profile from shell output instead of exec_command
         self._build_device_profile(session_key, initial_output)
 
+        # Capture the actual prompt for this session
+        self._capture_prompt(session_key, shell)
+
         # For non-POSIX Unix shells, start bash to avoid compatibility issues
+        # We do this AFTER capturing the initial prompt to ensure the shell is responsive
         device_type = self._session_shell_types.get(session_key, 'unknown')
         if device_type == 'unix_shell':
             # Detect non-POSIX shells (fish, nushell, elvish, etc.)
-            if any(indicator in initial_output.lower() for indicator in ['fish', 'nushell', 'elvish', 'xonsh']):
-                logger.info(f"Detected non-POSIX shell, starting bash for {session_key}")
+            is_non_posix = any(indicator in initial_output.lower() for indicator in ['fish', 'nushell', 'elvish', 'xonsh'])
+            
+            # If not detected from banner, specifically probe for fish shell
+            if not is_non_posix:
+                logger.debug(f"Probing for fish shell on {session_key}")
+                # Use a probe that works in both bash and fish but produces different output
+                # In fish, $FISH_VERSION is set. In bash, it's usually not.
+                shell.send('echo "FISH_CHECK:$FISH_VERSION"\n')
+                
+                probe_output = ""
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    if shell.recv_ready():
+                        probe_output += shell.recv(4096).decode('utf-8', errors='ignore')
+                        if "FISH_CHECK:" in probe_output and "\n" in probe_output:
+                            break
+                    time.sleep(0.1)
+                
+                logger.debug(f"Probe output: {repr(probe_output)}")
+
+                # Look for version number pattern after FISH_CHECK:
+                # Fish: FISH_CHECK:3.6.1
+                # Bash: FISH_CHECK:
+                if re.search(r"FISH_CHECK:\d+\.", probe_output):
+                    logger.info(f"Detected fish shell via probe, starting bash for {session_key}")
+                    is_non_posix = True
+
+            if is_non_posix:
+                logger.info(f"Starting bash for {session_key} (non-POSIX shell detected)")
                 shell.send('bash\n')
                 time.sleep(0.5)
                 if shell.recv_ready():
                     shell.recv(4096)  # Clear bash startup output
-
-        # Capture the actual prompt for this session
-        self._capture_prompt(session_key, shell)
+                
+                # Recapture prompt for the new bash shell
+                logger.info(f"Recapturing prompt for bash shell on {session_key}")
+                self._capture_prompt(session_key, shell)
 
         logger.info(f"New shell for {session_key} is ready")
         return shell
@@ -955,6 +987,8 @@ class SSHSessionManager:
                         shell.send(f"{sudo_password}\n")
                         password_sent = True
                         time.sleep(0.3)
+                        # Clear output buffer to avoid re-detecting the prompt
+                        raw_output = ""
                         continue
 
                     if not should_continue:
