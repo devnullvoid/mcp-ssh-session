@@ -346,6 +346,65 @@ class CommandExecutor:
                 logger.error(f"Failed to send input: {e}", exc_info=True)
                 return False, "", f"Failed to send input: {e}"
 
+    def _retrieve_exit_code(self, shell: Any, session_key: str) -> int:
+        """Attempt to retrieve the exit code of the last command executed in the shell."""
+        logger = self.logger.getChild('retrieve_exit_code')
+        try:
+            # Determine correct syntax for exit code check
+            shell_type = self._session_manager._session_shell_types.get(session_key, 'unknown').lower()
+            if 'fish' in shell_type:
+                cmd = "echo $status\n"
+            elif 'csh' in shell_type or 'tcsh' in shell_type:
+                cmd = "echo $status\n"
+            else:
+                cmd = "echo $?\n"
+
+            # Send command
+            shell.send(cmd)
+            time.sleep(0.2)
+
+            # Read output
+            output = ""
+            start_time = time.time()
+            # Wait up to 2 seconds for response
+            while time.time() - start_time < 2.0:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='ignore')
+                    output += chunk
+                    if '\n' in output.strip():
+                        break
+                time.sleep(0.1)
+
+            # Parse output
+            # Output will contain the command echo (maybe) and the result number
+            clean_output = self._session_manager._strip_ansi(output)
+
+            # Look for the last number in the output
+            matches = re.findall(r'\b(\d+)\b', clean_output)
+            if matches:
+                # The last number is likely the exit code
+                # But we need to be careful about the command echo "echo 0"
+                # If we send "echo $?", we might get:
+                # echo $?
+                # 0
+                # prompt
+
+                # If we have multiple numbers, the last one before the prompt (if any) or just the last line number
+                # A safer bet is searching for a line that is just digits
+                lines = [line.strip() for line in clean_output.splitlines() if line.strip()]
+                for line in reversed(lines):
+                    if line.isdigit():
+                        code = int(line)
+                        logger.debug(f"Retrieved exit code: {code}")
+                        return code
+
+            logger.warning(f"Could not parse exit code from output: {repr(output)}")
+            return 0  # Default to 0 if we can't determine
+
+        except Exception as e:
+            logger.error(f"Error retrieving exit code: {e}")
+            return 0
+
     def _continue_monitoring_timeout_background(self, command_id: str, cmd: Any,
                                                 session_key: str, timeout_occurred_at: float) -> None:
         """Background task to monitor shell output after a timeout occurred.
@@ -365,6 +424,8 @@ class CommandExecutor:
         output_limiter = OutputLimiter()
         # Estimate current size
         output_limiter.current_size = len(cmd.stdout.encode('utf-8'))
+
+        last_log_time = 0.0
 
         try:
             while time.time() - start_time < max_additional_timeout:
@@ -403,7 +464,11 @@ class CommandExecutor:
                                 return
 
                             last_recv_time = time.time()
-                            logger.debug(f"[TIMEOUT_MONITOR_RECV] Received {len(chunk)} bytes")
+
+                            # Rate limit logging (max once per second unless large chunk)
+                            if len(chunk) > 1000 or (time.time() - last_log_time) > 1.0:
+                                logger.debug(f"[TIMEOUT_MONITOR_RECV] Received {len(chunk)} bytes")
+                                last_log_time = time.time()
 
                             # Check for interactive prompts
                             awaiting = self._session_manager._detect_awaiting_input(cmd.stdout)
@@ -422,11 +487,15 @@ class CommandExecutor:
                             )
                             if is_complete:
                                 logger.info(f"[TIMEOUT_MONITOR_COMPLETE] Prompt detected - command complete")
+
+                                # Try to retrieve actual exit code
+                                exit_code = self._retrieve_exit_code(cmd.shell, session_key)
+
                                 with self._lock:
                                     if command_id in self._commands:
                                         cmd.stdout = cleaned_output
                                         cmd.status = CommandStatus.COMPLETED
-                                        cmd.exit_code = 0
+                                        cmd.exit_code = exit_code
                                         cmd.end_time = datetime.now()
                                 return
                     else:
@@ -440,11 +509,15 @@ class CommandExecutor:
                             )
                             if is_complete:
                                 logger.info(f"[TIMEOUT_MONITOR_IDLE_COMPLETE] Idle timeout with prompt - command complete")
+
+                                # Try to retrieve actual exit code
+                                exit_code = self._retrieve_exit_code(cmd.shell, session_key)
+
                                 with self._lock:
                                     if command_id in self._commands:
                                         cmd.stdout = cleaned_output
                                         cmd.status = CommandStatus.COMPLETED
-                                        cmd.exit_code = 0
+                                        cmd.exit_code = exit_code
                                         cmd.end_time = datetime.now()
                                 return
 
@@ -488,6 +561,8 @@ class CommandExecutor:
         # Estimate current size
         output_limiter.current_size = len(cmd.stdout.encode('utf-8'))
 
+        last_log_time = 0.0
+
         try:
             while time.time() - start_time < max_timeout:
                 # Check cancellation signal
@@ -516,9 +591,16 @@ class CommandExecutor:
                                 return
 
                             last_recv_time = time.time()
-                            logger.debug(f"[BG_MONITOR_RECV] Received {len(chunk)} bytes: {repr(chunk[:100])}")
+
+                            # Rate limit logging (max once per second unless large chunk)
+                            if len(chunk) > 1000 or (time.time() - last_log_time) > 1.0:
+                                logger.debug(f"[BG_MONITOR_RECV] Received {len(chunk)} bytes: {repr(chunk[:100])}")
+                                last_log_time = time.time()
                         else:
-                            logger.debug(f"[BG_MONITOR_EMPTY] recv() returned empty chunk")
+                            # Rate limit empty chunk logging significantly (every 5 seconds)
+                            if (time.time() - last_log_time) > 5.0:
+                                logger.debug(f"[BG_MONITOR_EMPTY] recv() returned empty chunk")
+                                last_log_time = time.time()
                     else:
                         # No data available - check if we've timed out from inactivity
                         elapsed_idle = time.time() - last_recv_time

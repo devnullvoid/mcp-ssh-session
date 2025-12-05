@@ -1367,15 +1367,34 @@ class SSHSessionManager:
         logger = self.logger.getChild('enable_mode_command')
 
         try:
+            # Get the persistent shell for this session
+            shell = self._get_or_create_shell(session_key, client)
+            shell.settimeout(timeout)
+
+            # Validate enable mode state if we think we are enabled
+            if self._enable_mode.get(session_key, False):
+                # Clear pending output first
+                if shell.recv_ready():
+                    shell.recv(4096)
+
+                # Check prompt
+                shell.send('\n')
+                time.sleep(0.5)
+
+                if shell.recv_ready():
+                    output = shell.recv(4096).decode('utf-8', errors='ignore')
+                    clean = self._strip_ansi(output).strip()
+                    # Check if prompt ends with # (standard enable mode indicator)
+                    # We also check if it contains '>' which usually indicates user mode
+                    if clean and not clean.endswith('#') and (clean.endswith('>') or '>' in clean.splitlines()[-1]):
+                        logger.warning(f"Enable mode validation failed. Prompt '{clean}' does not appear to be enable mode. Re-entering enable mode.")
+                        self._enable_mode[session_key] = False
+
             # Enter enable mode if not already in it
             if not self._enable_mode.get(session_key, False):
                 success, message = self._enter_enable_mode(session_key, client, enable_password, enable_command)
                 if not success:
                     return "", f"Failed to enter enable mode: {message}", 1
-
-            # Get the persistent shell for this session
-            shell = self._get_or_create_shell(session_key, client)
-            shell.settimeout(timeout)
 
             # Clear any pending output
             if shell.recv_ready():
