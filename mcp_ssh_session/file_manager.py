@@ -1,4 +1,5 @@
 """File management for SSH sessions."""
+import base64
 import logging
 import posixpath
 import shlex
@@ -234,13 +235,18 @@ class FileManager:
                     return "", f"Failed to create directories: {stderr}", exit_code
 
         # Write content using tee (supports both write and append)
-        escaped_content = content.replace('\\', '\\\\').replace('"', '\"').replace('$', r'\$').replace('`', r'\`')
+        # Use base64 encoding to avoid shell escaping issues with special characters
+        try:
+            encoded_content = base64.b64encode(content.encode(used_encoding, used_errors)).decode('ascii')
 
-        if append:
-            cmd = f'echo -n "{escaped_content}" | sudo tee -a {shlex.quote(remote_path)} > /dev/null'
-        else:
-            cmd = f'echo -n "{escaped_content}" | sudo tee {shlex.quote(remote_path)} > /dev/null'
-        logger.debug(f"Executing write command: {cmd[:100]}...")
+            if append:
+                cmd = f'echo "{encoded_content}" | base64 -d | sudo tee -a {shlex.quote(remote_path)} > /dev/null'
+            else:
+                cmd = f'echo "{encoded_content}" | base64 -d | sudo tee {shlex.quote(remote_path)} > /dev/null'
+            logger.debug(f"Executing write command (base64 encoded): {cmd[:100]}...")
+        except Exception as e:
+            logger.error(f"Failed to encode content for safe writing: {e}")
+            return "", f"Failed to encode content for safe writing: {e}", 1
 
         stdout, stderr, exit_code = exec_sudo(cmd)
 
