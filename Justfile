@@ -75,6 +75,18 @@ test-network host user password enable_password:
     export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
     just test
 
+# Convenience recipe: Run concurrency tests
+# Usage: just test-concurrency host=myhost user=myuser sudo_password=pass [password=pass] [keyfile=~/.ssh/id_rsa]
+test-concurrency host user sudo_password password="" keyfile="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export SSH_TEST_HOST="{{host}}"
+    export SSH_TEST_USER="{{user}}"
+    export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
+    [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
+    [ -n "{{keyfile}}" ] && export SSH_TEST_KEY_FILE="{{keyfile}}"
+    uv run pytest tests/test_concurrency.py -v -s
+
 # Run the MCP SSH Session server
 run:
     @echo "Starting MCP SSH Session server..."

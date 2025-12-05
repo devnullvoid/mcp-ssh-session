@@ -471,7 +471,7 @@ class CommandExecutor:
                                 last_log_time = time.time()
 
                             # Check for interactive prompts
-                            awaiting = self._session_manager._detect_awaiting_input(cmd.stdout)
+                            awaiting = self._session_manager._detect_awaiting_input(cmd.stdout, session_key)
                             if awaiting:
                                 logger.info(f"[TIMEOUT_MONITOR_AWAITING] Command awaiting input: {awaiting}")
                                 with self._lock:

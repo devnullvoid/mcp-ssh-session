@@ -49,6 +49,7 @@ class SSHSessionManager:
         self._command_validator = CommandValidator()
         self._active_commands: Dict[str, Any] = {}
         self._max_completed_commands = 100  # Keep last 100 completed commands
+        self._log_rate_limits: Dict[str, float] = {}  # Track last log time for rate limiting
 
         # Setup logging
         log_dir = Path('/tmp/mcp_ssh_session_logs')
@@ -75,6 +76,14 @@ class SSHSessionManager:
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
 
+    def _log_debug_rate_limited(self, logger, key: str, msg: str, interval: float = 5.0):
+        """Log a debug message only if enough time has passed since last log with this key."""
+        current_time = time.time()
+        last_time = self._log_rate_limits.get(key, 0)
+        
+        if current_time - last_time > interval:
+            logger.debug(msg)
+            self._log_rate_limits[key] = current_time
 
     def _resolve_connection(self, host: str, username: Optional[str], port: Optional[int]) -> tuple[Dict[str, Any], str, str, int, str]:
         """Resolve SSH connection parameters using config precedence."""
@@ -320,6 +329,12 @@ class SSHSessionManager:
         self._session_shell_types.pop(session_key, None)
         self._session_prompt_patterns.pop(session_key, None)
         self._session_prompts.pop(session_key, None)
+
+        # Clean up rate limits
+        keys_to_remove = [k for k in list(self._log_rate_limits.keys()) if k.startswith(f"{session_key}_")]
+        for k in keys_to_remove:
+            del self._log_rate_limits[k]
+
         if session_key in self._session_shell_types:
             del self._session_shell_types[session_key]
 
@@ -995,7 +1010,7 @@ class SSHSessionManager:
                         return raw_output, f"Output truncated at {output_limiter.max_size} bytes", 124
 
                     # Check for interactive prompts (SSH host key, etc.) BEFORE checking completion
-                    awaiting = self._detect_awaiting_input(raw_output)
+                    awaiting = self._detect_awaiting_input(raw_output, session_key)
                     if awaiting:
                         logger.info(f"Sudo command waiting for input: {awaiting}")
                         return raw_output, f"Command requires input: {awaiting}", 1
@@ -1018,7 +1033,7 @@ class SSHSessionManager:
                             break
                         
                         # Check for interactive prompts during idle
-                        awaiting = self._detect_awaiting_input(raw_output)
+                        awaiting = self._detect_awaiting_input(raw_output, session_key)
                         if awaiting:
                             logger.info(f"Sudo command waiting for input (idle): {awaiting}")
                             return raw_output, f"Command requires input: {awaiting}", 1
@@ -1082,7 +1097,8 @@ class SSHSessionManager:
 
                 # Debug: show what we're matching against
                 last_100 = clean_output.rstrip()[-100:] if len(clean_output) > 100 else clean_output.rstrip()
-                logger.debug(f"Checking wildcard pattern '{literal_prompt}' (regex: '{pattern.pattern}') against last 100 chars: {repr(last_100)}")
+                self._log_debug_rate_limited(logger, f"{session_key}_prompt_check", 
+                    f"Checking wildcard pattern '{literal_prompt}' (regex: '{pattern.pattern}') against last 100 chars: {repr(last_100)}")
 
                 match = pattern.search(clean_output.rstrip())
                 if match:
@@ -1091,7 +1107,7 @@ class SSHSessionManager:
                     logger.debug(f"Wildcard pattern matched! Matched text: {repr(match.group())}")
                     return True, output
                 else:
-                    logger.debug(f"Wildcard pattern did not match")
+                    self._log_debug_rate_limited(logger, f"{session_key}_prompt_nomatch", "Wildcard pattern did not match")
             else:
                 # Exact literal match
                 if clean_output.rstrip().endswith(literal_prompt):
@@ -1111,14 +1127,15 @@ class SSHSessionManager:
 
         return False, clean_output
 
-    def _detect_awaiting_input(self, output: str) -> Optional[str]:
+    def _detect_awaiting_input(self, output: str, session_key: str = "global") -> Optional[str]:
         """Detect if command is waiting for user input.
 
         Returns string describing what input is needed, or None if not awaiting input.
         """
         logger = self.logger.getChild('awaiting_input')
         last_100 = output[-100:] if len(output) > 100 else output
-        logger.debug(f"Checking for awaiting input, last 100 chars: {repr(last_100)}")
+        self._log_debug_rate_limited(logger, f"{session_key}_awaiting_input", 
+            f"Checking for awaiting input, last 100 chars: {repr(last_100)}")
         
         # Common password prompts - match various formats like "password:", "password for user:", etc.
         # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
@@ -1255,7 +1272,7 @@ class SSHSessionManager:
                         return raw_output, "Output limit exceeded", 124, None
 
                     # Check for interactive prompts BEFORE checking for completion
-                    awaiting = self._detect_awaiting_input(raw_output)
+                    awaiting = self._detect_awaiting_input(raw_output, session_key)
                     if awaiting:
                         logger.info(f"Detected interactive prompt: {awaiting}")
                         # Automatically handle pagers by sending 'q' to quit
@@ -1315,7 +1332,7 @@ class SSHSessionManager:
                         clean_output = self._strip_ansi(raw_output)
 
                         # Check for interactive prompts BEFORE checking for completion
-                        awaiting = self._detect_awaiting_input(raw_output)
+                        awaiting = self._detect_awaiting_input(raw_output, session_key)
                         if awaiting:
                             logger.info(f"Detected interactive prompt during idle timeout: {awaiting}")
                             # Automatically handle pagers by sending 'q' to quit

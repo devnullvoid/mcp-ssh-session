@@ -103,9 +103,15 @@ class FileManager:
             logger.debug(f"Sudo fallback command: {cmd}")
 
             if sudo_password:
-                stdout, stderr, exit_code = self._session_manager._execute_sudo_command(client, cmd, sudo_password, timeout=30)
+                stdout, stderr, exit_code = self._session_manager.execute_command(
+                    host=host, username=username, password=password, key_filename=key_filename,
+                    port=port, command=cmd, sudo_password=sudo_password, timeout=30
+                )
             else:
-                stdout, stderr, exit_code = self._session_manager._execute_standard_command_internal(client, cmd, 30, session_key)
+                stdout, stderr, exit_code = self._session_manager.execute_command(
+                    host=host, username=username, password=password, key_filename=key_filename,
+                    port=port, command=cmd, timeout=30
+                )
 
             if exit_code != 0:
                 logger.error(f"Sudo fallback failed for {remote_path}: {stderr}")
@@ -219,9 +225,10 @@ class FileManager:
 
         # Helper to execute with or without password
         def exec_sudo(cmd: str) -> tuple[str, str, int]:
-            if sudo_password:
-                return self._session_manager._execute_sudo_command(client, cmd, sudo_password, timeout=30)
-            return self._session_manager._execute_standard_command_internal(client, cmd, 30, session_key)
+            return self._session_manager.execute_command(
+                host=host, username=username, password=password, key_filename=key_filename,
+                port=port, command=cmd, sudo_password=sudo_password, timeout=30
+            )
 
         # Create parent directories if needed
         if make_dirs:
