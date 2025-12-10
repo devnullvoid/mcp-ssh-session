@@ -105,3 +105,5 @@ clean:
     find . -name "*.pyc" -exec rm -f {} +
     find . -name "*.log" -exec rm -f {} +
     @echo "Cleanup complete."
+test-mikrotik:
+    PYTHONPATH=. pytest tests/test_mikrotik.py

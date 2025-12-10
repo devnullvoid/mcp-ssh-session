@@ -1080,8 +1080,9 @@ class SSHSessionManager:
                 # Convert to pattern for wildcard matching
                 # Escape special regex chars except * and []
                 pattern_str = re.escape(literal_prompt).replace(r'\*', '.*?')
-                # Un-escape character classes like [>#]
-                pattern_str = pattern_str.replace(r'\[', '[').replace(r'\]', ']')
+                # Un-escape specific character classes we use (like [>#] from enable mode)
+                # Do NOT unescape all brackets as that breaks literal brackets in prompts
+                pattern_str = pattern_str.replace(r'\[>#\]', '[>#]').replace(r'\[\$#\]', '[$#]')
                 # Ensure it matches at end of output
                 pattern = re.compile(re.escape('').join([pattern_str, r'\s*$']))
 
@@ -1268,6 +1269,11 @@ class SSHSessionManager:
                         # Automatically handle pagers by sending 'q' to quit
                         if awaiting == "pager":
                             logger.info("Automatically handling pager - sending 'q' to quit")
+
+                            # Strip MikroTik pager prompt from output to avoid agent confusion
+                            # Match raw output as detection does
+                            raw_output = re.sub(r'--\s*\[Q quit\|D dump\|.*?\]\s*$', '', raw_output)
+
                             shell.send('q')
                             # Continue collecting output after quitting pager
                             time.sleep(0.3)
@@ -1348,7 +1354,7 @@ class SSHSessionManager:
                                     self._session_prompts.pop(session_key, None)
                                 self._capture_prompt(session_key, shell)
 
-                            return cleaned_output, "", 0, None
+                        return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")
