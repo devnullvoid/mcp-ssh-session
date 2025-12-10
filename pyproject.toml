@@ -34,3 +34,8 @@ Issues = "https://github.com/devnullvoid/mcp-ssh-session/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+]

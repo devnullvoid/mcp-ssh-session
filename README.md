@@ -68,6 +68,12 @@ Execute a command on an SSH host using a persistent session.
 
 **Smart Execution**: Starts synchronously and waits for completion. If timeout is reached, automatically transitions to async mode and returns a command ID. Server never hangs!
 
+**Advanced Features**:
+- Automatic timeout handling with async transition
+- Interactive command support (use `send_input` for prompts)
+- Command interruption capability (`interrupt_command_by_id`)
+- Session persistence across multiple commands
+
 **Using SSH config alias:**
 ```json
 {
@@ -125,6 +131,11 @@ Close all active SSH sessions.
 
 #### `execute_command_async`
 Execute a command asynchronously without blocking the server. Returns a command ID for tracking.
+
+**Use with companion tools**:
+- `get_command_status(command_id)` - Check progress and retrieve output
+- `interrupt_command_by_id(command_id)` - Send Ctrl+C to stop execution  
+- `send_input(command_id, text)` - Provide input to interactive commands
 
 ```json
 {

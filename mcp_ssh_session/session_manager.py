@@ -1,10 +1,10 @@
 """SSH session manager using Paramiko."""
-import logging
 import os
 import re
 import threading
 import time
 import uuid
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -15,6 +15,11 @@ from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
 from .file_manager import FileManager
 from .validation import CommandValidator, OutputLimiter
+from .logging_manager import get_logger, get_context_logger, RateLimitedLogger
+from .error_handler import ErrorHandler, ProgressReporter
+from .session_diagnostics import SessionDiagnostics, ConnectionProfileManager
+from .enhanced_executor import EnhancedCommandExecutor
+from .datastructures import ErrorInfo, ErrorCategory
 
 
 class SSHSessionManager:
@@ -51,39 +56,24 @@ class SSHSessionManager:
         self._max_completed_commands = 100  # Keep last 100 completed commands
         self._log_rate_limits: Dict[str, float] = {}  # Track last log time for rate limiting
 
-        # Setup logging
-        log_dir = Path('/tmp/mcp_ssh_session_logs')
-        log_dir.mkdir(exist_ok=True, parents=True)
-        log_file = log_dir / 'mcp_ssh_session.log'
+        # Setup optimized logging
+        self.logger = get_logger('ssh_session')
+        self.context_logger = get_context_logger('ssh_session')
+        self.logger.info("SSHSessionManager initialized with enhanced logging")
+        
+        # Initialize enhanced components
+        self.enhanced_executor = EnhancedCommandExecutor(self)
+        self.session_diagnostics = SessionDiagnostics(self)
+        self.connection_profiles = ConnectionProfileManager(self)
 
-        # Configure logger - only log to file, not to stdout (which would send MCP notifications)
-        self.logger = logging.getLogger('ssh_session')
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.propagate = False  # Don't propagate to root logger
-
-        # Remove existing handlers to prevent duplicates when multiple instances are created
-        if self.logger.handlers:
-            self.logger.handlers.clear()
-
-        # Only add file handler (no StreamHandler to avoid MCP notifications)
-        file_handler = logging.FileHandler(str(log_file))
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - [%(threadName)s] - %(name)s - %(levelname)s - %(message)s'
-        ))
-        self.logger.addHandler(file_handler)
         self.logger.info("SSHSessionManager initialized")
 
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
 
-    def _log_debug_rate_limited(self, logger, key: str, msg: str, interval: float = 5.0):
+    def _log_debug_rate_limited(self, key: str, msg: str, interval: float = 5.0):
         """Log a debug message only if enough time has passed since last log with this key."""
-        current_time = time.time()
-        last_time = self._log_rate_limits.get(key, 0)
-        
-        if current_time - last_time > interval:
-            logger.debug(msg)
-            self._log_rate_limits[key] = current_time
+        self.logger.debug(msg, key)
 
     def _resolve_connection(self, host: str, username: Optional[str], port: Optional[int]) -> tuple[Dict[str, Any], str, str, int, str]:
         """Resolve SSH connection parameters using config precedence."""
@@ -1561,6 +1551,38 @@ class SSHSessionManager:
             host, username, command, password, key_filename, port,
             enable_password, enable_command, sudo_password, timeout
         )
+    
+    def execute_command_enhanced(self, host: str, username: Optional[str] = None,
+                               command: str = "", password: Optional[str] = None,
+                               key_filename: Optional[str] = None, port: Optional[int] = None,
+                               enable_password: Optional[str] = None, enable_command: str = "enable",
+                               sudo_password: Optional[str] = None, timeout: int = 30,
+                               auto_extend_timeout: bool = True, max_timeout: int = 600,
+                               streaming_mode: bool = False, progress_callback: Optional[str] = None) -> str:
+        """Execute command with enhanced features."""
+        return self.enhanced_executor.execute_command_enhanced(
+            host, username, command, password, key_filename, port,
+            enable_password, enable_command, sudo_password, timeout,
+            auto_extend_timeout, max_timeout, streaming_mode, progress_callback
+        )
+    
+    def get_session_diagnostics(self, host: str, username: Optional[str] = None,
+                               port: Optional[int] = None):
+        """Get session diagnostics."""
+        return self.session_diagnostics.get_session_diagnostics(host, username, port)
+    
+    def reset_session_prompt(self, host: str, username: Optional[str] = None,
+                             port: Optional[int] = None) -> bool:
+        """Reset session prompt detection."""
+        return self.session_diagnostics.reset_session_prompt_detection(host, username, port)
+    
+    def get_connection_health_report(self):
+        """Get connection health report."""
+        return self.session_diagnostics.get_connection_health_report()
+    
+    def get_performance_metrics(self):
+        """Get performance metrics from logging."""
+        return self.logger.get_performance_report()
 
     def execute_command_async(self, host: str, username: Optional[str] = None,
                              command: str = "", password: Optional[str] = None,

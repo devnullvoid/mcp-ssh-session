@@ -23,7 +23,7 @@ def execute_command(
     timeout: int = 30
 ) -> str:
     """Execute a command on an SSH host using a persistent session.
-    
+
     Starts synchronously and waits for completion. If the command doesn't complete
     within the timeout, it automatically transitions to async mode and returns a
     command ID for tracking.
@@ -37,6 +37,12 @@ def execute_command(
     For Unix/Linux hosts requiring sudo, use sudo_password to automatically handle
     the sudo password prompt. The command will be automatically prefixed with 'sudo'
     if not already present.
+
+    Advanced Features:
+    - Automatic timeout handling with async transition
+    - Interactive command support with input capability
+    - Command interruption (Ctrl+C) for stuck processes
+    - Session persistence across multiple commands
 
     Args:
         host: Hostname, IP address, or SSH config alias (e.g., "myserver")
@@ -306,10 +312,15 @@ def execute_command_async(
     timeout: int = 300
 ) -> str:
     """Execute a command asynchronously without blocking the server.
-    
+
     Returns a command ID that can be used to check status, retrieve output, or interrupt.
     Useful for long-running commands like 'sleep 60', monitoring tasks, or large operations.
-    
+
+    Use with companion tools:
+    - get_command_status(command_id) to check progress and retrieve output
+    - interrupt_command_by_id(command_id) to send Ctrl+C and stop execution
+    - send_input(command_id, text) to provide input to interactive commands
+
     Args:
         host: Hostname, IP address, or SSH config alias
         command: Command to execute
