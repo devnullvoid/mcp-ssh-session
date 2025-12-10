@@ -1,6 +1,6 @@
 [project]
 name = "mcp-ssh-session"
-version = "0.1.7"
+version = "0.1.8"
 description = "MCP server for managing persistent SSH sessions"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -36,6 +36,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = [
-    "pytest>=9.0.1",
-]
+dev = ["pytest>=9.0.1"]
