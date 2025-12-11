@@ -105,5 +105,14 @@ clean:
     find . -name "*.pyc" -exec rm -f {} +
     find . -name "*.log" -exec rm -f {} +
     @echo "Cleanup complete."
-test-mikrotik:
-    PYTHONPATH=. pytest tests/test_mikrotik.py
+# Convenience recipe: Run Mikrotik tests
+# Usage: just test-mikrotik host=router [user=admin] [password=cisco] [enable_password=enable] [port=22]
+test-mikrotik host user="admin" password="" enable_password="" port="22":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export SSH_TEST_HOST="{{host}}"
+    export SSH_TEST_USER="{{user}}"
+    [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
+    [ -n "{{enable_password}}" ] && export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
+    [ "{{port}}" != "22" ] && export SSH_TEST_PORT="{{port}}"
+    uv run pytest tests/test_mikrotik.py -v -s
