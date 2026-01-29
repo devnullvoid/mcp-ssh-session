@@ -16,6 +16,8 @@ try:
 except AttributeError:  # Paramiko 4.x moved it
     from paramiko.ssh_exception import NoValidConnectionsError  # type: ignore
 
+import pyte
+
 from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
 from .file_manager import FileManager
@@ -69,6 +71,11 @@ class SSHSessionManager:
             str, float
         ] = {}  # Track last log time for rate limiting
 
+        # Terminal emulator support (opt-in via feature flag)
+        self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "0") == "1"
+        self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
+        self._session_modes: Dict[str, str] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
+
         # Setup optimized logging
         self.logger = get_logger("ssh_session")
         self.context_logger = get_context_logger("ssh_session")
@@ -79,10 +86,118 @@ class SSHSessionManager:
         self.session_diagnostics = SessionDiagnostics(self)
         self.connection_profiles = ConnectionProfileManager(self)
 
+        if self._interactive_mode:
+            self.logger.info("Interactive PTY mode enabled")
         self.logger.info("SSHSessionManager initialized")
 
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
+
+    def _feed_emulator(self, session_key: str, data: str) -> None:
+        """Feed data to terminal emulator if interactive mode is enabled."""
+        if self._interactive_mode and session_key in self._session_emulators:
+            _, stream = self._session_emulators[session_key]
+            stream.feed(data)
+            # Update mode after feeding
+            self._infer_mode_from_screen(session_key)
+
+    def _infer_mode_from_screen(self, session_key: str) -> str:
+        """Infer the current mode from screen content.
+        
+        Returns:
+            Mode string: 'editor', 'pager', 'password_prompt', 'shell', or 'unknown'
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return 'unknown'
+        
+        screen, _ = self._session_emulators[session_key]
+        
+        # Get screen content
+        lines = []
+        for y in range(screen.lines):
+            line = screen.display[y].rstrip()
+            if line:
+                lines.append(line)
+        
+        if not lines:
+            mode = 'unknown'
+        else:
+            last_line = lines[-1] if lines else ""
+            screen_text = '\n'.join(lines)
+            
+            # Check for editor (vim, nano)
+            # Vim: status line with -- INSERT --, -- VISUAL --, or many ~ lines
+            if any(marker in screen_text for marker in ['-- INSERT --', '-- VISUAL --', '-- REPLACE --']):
+                mode = 'editor'
+            elif screen_text.count('~') > 5 and any('~' in line for line in lines[-10:]):
+                # Many tildes in last 10 lines suggests vim
+                mode = 'editor'
+            elif 'GNU nano' in screen_text or '^G Get Help' in screen_text:
+                mode = 'editor'
+            # Check for pager (less, more)
+            elif '(END)' in last_line or last_line.strip() == ':':
+                mode = 'pager'
+            elif '--More--' in last_line or '-- [Q quit|D dump' in last_line:
+                mode = 'pager'
+            # Check for password prompt
+            elif re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = 'password_prompt'
+            elif re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = 'password_prompt'
+            # Check for shell prompt (has prompt pattern)
+            elif session_key in self._session_prompts:
+                prompt = self._session_prompts[session_key]
+                # Handle wildcard prompts
+                if '*' in prompt or '[' in prompt:
+                    # Convert wildcard to regex
+                    pattern_str = re.escape(prompt).replace(r'\*', '.*?')
+                    pattern_str = pattern_str.replace(r'\[>#\]', '[>#]').replace(r'\[\$#\]', '[$#]')
+                    if re.search(pattern_str + r'\s*$', last_line):
+                        mode = 'shell'
+                    else:
+                        mode = 'unknown'
+                elif last_line.endswith(prompt.rstrip()):
+                    mode = 'shell'
+                else:
+                    mode = 'unknown'
+            else:
+                mode = 'unknown'
+        
+        # Store the mode
+        self._session_modes[session_key] = mode
+        return mode
+
+    def _get_screen_snapshot(self, session_key: str, max_lines: int = 24) -> dict:
+        """Get a snapshot of the terminal screen state.
+        
+        Returns:
+            dict with keys: lines (list of strings), cursor_x, cursor_y, width, height
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return {
+                "error": "Interactive mode not enabled or session not found",
+                "lines": [],
+                "cursor_x": 0,
+                "cursor_y": 0,
+                "width": 0,
+                "height": 0
+            }
+        
+        screen, _ = self._session_emulators[session_key]
+        
+        # Get screen lines (pyte stores them as a dict keyed by line number)
+        lines = []
+        for y in range(min(max_lines, screen.lines)):
+            line = screen.display[y]
+            lines.append(line.rstrip())
+        
+        return {
+            "lines": lines,
+            "cursor_x": screen.cursor.x,
+            "cursor_y": screen.cursor.y,
+            "width": screen.columns,
+            "height": screen.lines
+        }
 
     def _log_debug_rate_limited(
         self, logger: logging.Logger, key: str, msg: str, interval: float = 5.0
@@ -487,10 +602,21 @@ class SSHSessionManager:
         shell = client.invoke_shell()
         shell.resize_pty(width=100, height=24)
 
+        # Create terminal emulator if interactive mode is enabled
+        if self._interactive_mode:
+            screen = pyte.Screen(100, 24)
+            stream = pyte.Stream(screen)
+            self._session_emulators[session_key] = (screen, stream)
+            logger.debug(f"Created terminal emulator for {session_key}")
+
         time.sleep(1)  # Give shell time to initialize
         initial_output = ""
         if shell.recv_ready():
             initial_output = shell.recv(4096).decode("utf-8", errors="ignore")
+            # Feed to emulator if enabled
+            if self._interactive_mode and session_key in self._session_emulators:
+                _, stream = self._session_emulators[session_key]
+                stream.feed(initial_output)
 
         self._session_shells[session_key] = shell
 
@@ -1102,6 +1228,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -1286,6 +1413,20 @@ class SSHSessionManager:
         Returns string describing what input is needed, or None if not awaiting input.
         """
         logger = self.logger.getChild("awaiting_input")
+        
+        # Mode-aware gating (only when interactive mode is enabled)
+        if self._interactive_mode and session_key in self._session_modes:
+            mode = self._session_modes.get(session_key, 'unknown')
+            
+            # If in editor mode, don't flag as awaiting input
+            # Editors handle their own input and shouldn't be interrupted
+            if mode == 'editor':
+                logger.debug(f"In editor mode, skipping awaiting_input detection")
+                return None
+            
+            # For pager mode, allow pager detection to proceed
+            # For shell/password_prompt/unknown, use normal detection
+        
         last_100 = output[-100:] if len(output) > 100 else output
         self._log_debug_rate_limited(
             logger,
@@ -1445,6 +1586,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
@@ -1688,6 +1830,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
                     last_output_time = time.time()
