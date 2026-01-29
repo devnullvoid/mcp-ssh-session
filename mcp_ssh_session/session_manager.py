@@ -74,6 +74,7 @@ class SSHSessionManager:
         # Terminal emulator support (opt-in via feature flag)
         self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "0") == "1"
         self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
+        self._session_modes: Dict[str, str] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
 
         # Setup optimized logging
         self.logger = get_logger("ssh_session")
@@ -97,6 +98,65 @@ class SSHSessionManager:
         if self._interactive_mode and session_key in self._session_emulators:
             _, stream = self._session_emulators[session_key]
             stream.feed(data)
+            # Update mode after feeding
+            self._infer_mode_from_screen(session_key)
+
+    def _infer_mode_from_screen(self, session_key: str) -> str:
+        """Infer the current mode from screen content.
+        
+        Returns:
+            Mode string: 'editor', 'pager', 'password_prompt', 'shell', or 'unknown'
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return 'unknown'
+        
+        screen, _ = self._session_emulators[session_key]
+        
+        # Get screen content
+        lines = []
+        for y in range(screen.lines):
+            line = screen.display[y].rstrip()
+            if line:
+                lines.append(line)
+        
+        if not lines:
+            mode = 'unknown'
+        else:
+            last_line = lines[-1] if lines else ""
+            screen_text = '\n'.join(lines)
+            
+            # Check for editor (vim, nano)
+            # Vim: status line with -- INSERT --, -- VISUAL --, or many ~ lines
+            if any(marker in screen_text for marker in ['-- INSERT --', '-- VISUAL --', '-- REPLACE --']):
+                mode = 'editor'
+            elif screen_text.count('~') > 5 and any('~' in line for line in lines[-10:]):
+                # Many tildes in last 10 lines suggests vim
+                mode = 'editor'
+            elif 'GNU nano' in screen_text or '^G Get Help' in screen_text:
+                mode = 'editor'
+            # Check for pager (less, more)
+            elif '(END)' in last_line or last_line.strip() == ':':
+                mode = 'pager'
+            elif '--More--' in last_line or '-- [Q quit|D dump' in last_line:
+                mode = 'pager'
+            # Check for password prompt
+            elif re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = 'password_prompt'
+            elif re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = 'password_prompt'
+            # Check for shell prompt (has prompt pattern)
+            elif session_key in self._session_prompts:
+                prompt = self._session_prompts[session_key]
+                if last_line.endswith(prompt.rstrip()):
+                    mode = 'shell'
+                else:
+                    mode = 'unknown'
+            else:
+                mode = 'unknown'
+        
+        # Store the mode
+        self._session_modes[session_key] = mode
+        return mode
 
     def _get_screen_snapshot(self, session_key: str, max_lines: int = 24) -> dict:
         """Get a snapshot of the terminal screen state.
@@ -1344,6 +1404,20 @@ class SSHSessionManager:
         Returns string describing what input is needed, or None if not awaiting input.
         """
         logger = self.logger.getChild("awaiting_input")
+        
+        # Mode-aware gating (only when interactive mode is enabled)
+        if self._interactive_mode and session_key in self._session_modes:
+            mode = self._session_modes.get(session_key, 'unknown')
+            
+            # If in editor mode, don't flag as awaiting input
+            # Editors handle their own input and shouldn't be interrupted
+            if mode == 'editor':
+                logger.debug(f"In editor mode, skipping awaiting_input detection")
+                return None
+            
+            # For pager mode, allow pager detection to proceed
+            # For shell/password_prompt/unknown, use normal detection
+        
         last_100 = output[-100:] if len(output) > 100 else output
         self._log_debug_rate_limited(
             logger,

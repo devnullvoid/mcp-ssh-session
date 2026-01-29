@@ -245,3 +245,174 @@ class TestInteractivePTY:
         assert snapshot["lines"] == []
         assert snapshot["width"] == 0
         assert snapshot["height"] == 0
+
+
+class TestModeInference:
+    """Test mode inference from screen content."""
+
+    def test_mode_inference_vim_insert(self):
+        """Test detection of vim in insert mode."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        # Create a fake session with emulator
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate vim insert mode output
+        vim_output = "\n" * 20 + "-- INSERT --\n"
+        stream.feed(vim_output)
+        
+        # Infer mode
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'editor'
+        assert manager._session_modes[session_key] == 'editor'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_inference_vim_tildes(self):
+        """Test detection of vim by tilde markers."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate vim with many tildes
+        vim_output = "~\n" * 10
+        stream.feed(vim_output)
+        
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'editor'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_inference_nano(self):
+        """Test detection of nano editor."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate nano output
+        nano_output = "  GNU nano 6.2\n\n^G Get Help  ^O Write Out\n"
+        stream.feed(nano_output)
+        
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'editor'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_inference_less_pager(self):
+        """Test detection of less pager."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate less pager at end
+        pager_output = "Line 1\nLine 2\nLine 3\n(END)"
+        stream.feed(pager_output)
+        
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'pager'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_inference_less_colon(self):
+        """Test detection of less pager with colon prompt."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate less pager with : prompt
+        pager_output = "Line 1\nLine 2\n:"
+        stream.feed(pager_output)
+        
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'pager'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_inference_password_prompt(self):
+        """Test detection of password prompt."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        import pyte
+        screen = pyte.Screen(100, 24)
+        stream = pyte.Stream(screen)
+        manager._session_emulators[session_key] = (screen, stream)
+        
+        # Simulate password prompt
+        prompt_output = "[sudo] password for user:"
+        stream.feed(prompt_output)
+        
+        mode = manager._infer_mode_from_screen(session_key)
+        
+        assert mode == 'password_prompt'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_aware_awaiting_input_editor(self):
+        """Test that awaiting_input is skipped in editor mode."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        manager._session_modes[session_key] = 'editor'
+        
+        # Try to detect awaiting input (should return None for editor)
+        result = manager._detect_awaiting_input("some output", session_key)
+        
+        assert result is None
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+
+    def test_mode_aware_awaiting_input_pager(self):
+        """Test that awaiting_input works for pager mode."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "1"
+        
+        manager = SSHSessionManager()
+        
+        session_key = "test@localhost:22"
+        manager._session_modes[session_key] = 'pager'
+        
+        # Try to detect pager prompt
+        result = manager._detect_awaiting_input("some output\n(END)", session_key)
+        
+        assert result == 'pager'
+        
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
