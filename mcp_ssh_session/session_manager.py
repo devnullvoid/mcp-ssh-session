@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import paramiko
+try:
+    NoValidConnectionsError = paramiko.NoValidConnectionsError  # Paramiko <4.0
+except AttributeError:  # Paramiko 4.x moved it
+    from paramiko.ssh_exception import NoValidConnectionsError  # type: ignore
 
 from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
@@ -80,9 +84,15 @@ class SSHSessionManager:
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
 
-    def _log_debug_rate_limited(self, key: str, msg: str, interval: float = 5.0):
+    def _log_debug_rate_limited(
+        self, logger: logging.Logger, key: str, msg: str, interval: float = 5.0
+    ):
         """Log a debug message only if enough time has passed since last log with this key."""
-        self.logger.debug(msg, key)
+        now = time.time()
+        last_time = self._log_rate_limits.get(key, 0.0)
+        if now - last_time >= interval:
+            self._log_rate_limits[key] = now
+            logger.debug(msg)
 
     def _resolve_connection(
         self, host: str, username: Optional[str], port: Optional[int]
@@ -187,7 +197,7 @@ class SSHSessionManager:
             except (
                 paramiko.AuthenticationException,
                 paramiko.SSHException,
-                paramiko.NoValidConnectionsError,
+                NoValidConnectionsError,
                 OSError,
                 TimeoutError,
             ) as e:
@@ -1283,26 +1293,30 @@ class SSHSessionManager:
             f"Checking for awaiting input, last 100 chars: {repr(last_100)}",
         )
 
+        clean_output = self._strip_ansi(output)
+        lines = [line for line in clean_output.splitlines() if line.strip()]
+        last_line = lines[-1].strip() if lines else ""
+
         # Common password prompts - match various formats like "password:", "password for user:", etc.
         # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
         # We also exclude newlines, =, ", and ' from the wildcard to prevent matching
         # across lines, URL parameters, or JSON keys
-        if re.search(r'password[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+        if re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
             logger.debug("Detected password prompt")
             return "password"
-        if re.search(r'passphrase[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+        if re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
             logger.debug("Detected passphrase prompt")
             return "passphrase"
 
         # Pager prompts (less, more, MikroTik)
         # Match (END) with optional line numbers before it, or : on the last line
         # Strip ANSI codes from the end to properly detect pager prompts
-        clean_output = self._strip_ansi(output)
         if re.search(r"(?:^|[\r\n]).*?\(END\)\s*$", clean_output):
             logger.debug("Detected pager (END) prompt")
             return "pager"
-        if re.search(r"(?:^|[\r\n])\s*:\s*$", clean_output):
-            logger.debug("Detected pager : prompt")
+        if last_line == ":":
+            # Common pager prompt when less/most waits for input
+            logger.debug("Detected pager ':' prompt")
             return "pager"
 
         # MikroTik pager prompt
@@ -1320,7 +1334,7 @@ class SSHSessionManager:
         # Yes/no prompts
         if re.search(
             r"\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$",
-            output,
+            last_line,
             re.IGNORECASE,
         ):
             return "yes_no"
@@ -1328,13 +1342,16 @@ class SSHSessionManager:
         # Press any key / continue
         if re.search(
             r"(?:press any key|press enter|to continue)[:\.]*\s*$",
-            output,
+            last_line,
             re.IGNORECASE,
         ):
             return "press_key"
 
         # Generic prompt at end (anything ending with ? or prompt-like)
-        if re.search(r"(?:\?|-->|enter [a-z\s]+[:\s]*)$", output, re.IGNORECASE):
+        if last_line.endswith("?") and len(last_line) <= 80 and "|" not in last_line:
+            if not re.search(r"https?://|\bselect\b|\bfrom\b", last_line, re.IGNORECASE):
+                return "user_input"
+        if re.search(r"\benter\b[^:]{0,80}:\s*$", last_line, re.IGNORECASE):
             return "user_input"
 
         return None
@@ -1401,6 +1418,14 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
+            # Clear any pending output to avoid matching stale prompts
+            if shell.recv_ready():
+                try:
+                    while shell.recv_ready():
+                        shell.recv(4096)
+                except Exception:
+                    pass
+
             # Send command without sentinel - rely on prompt detection
             logger.info(f"Executing command on {session_key}: {command}")
             shell.send(command + "\n")
@@ -1412,6 +1437,7 @@ class SSHSessionManager:
             last_recv_time = start_time
             idle_timeout = 2.0
             seen_command_echo = False
+            echo_end_pos: Optional[int] = None
             # Ensure prompt pattern exists as fallback
             self._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
@@ -1425,6 +1451,11 @@ class SSHSessionManager:
 
                     if not seen_command_echo and "\n" in raw_output:
                         seen_command_echo = True
+                        # Record end of echo line so prompt detection only looks after it
+                        clean_snapshot = self._strip_ansi(raw_output)
+                        newline_idx = clean_snapshot.find("\n")
+                        if newline_idx != -1:
+                            echo_end_pos = newline_idx + 1
 
                     if not should_continue:
                         logger.warning("Output limit reached")
@@ -1433,33 +1464,44 @@ class SSHSessionManager:
                     # Check for interactive prompts BEFORE checking for completion
                     awaiting = self._detect_awaiting_input(raw_output, session_key)
                     if awaiting:
-                        logger.info(f"Detected interactive prompt: {awaiting}")
-                        # Automatically handle pagers by sending 'q' to quit
-                        if awaiting == "pager":
-                            logger.info(
-                                "Automatically handling pager - sending 'q' to quit"
+                        # Only treat as awaiting input after a brief idle and if prompt isn't present
+                        if (time.time() - last_recv_time) > 0.2:
+                            clean_output = self._strip_ansi(raw_output)
+                            tail_start = echo_end_pos or 0
+                            tail_clean = clean_output[tail_start:]
+                            is_complete, _ = self._check_prompt_completion(
+                                session_key, raw_output, tail_clean
                             )
+                            if not is_complete:
+                                logger.info(f"Detected interactive prompt: {awaiting}")
+                                # Automatically handle pagers by sending 'q' to quit
+                                if awaiting == "pager":
+                                    logger.info(
+                                        "Automatically handling pager - sending 'q' to quit"
+                                    )
 
-                            # Strip MikroTik pager prompt from output to avoid agent confusion
-                            # Match raw output as detection does
-                            raw_output = re.sub(
-                                r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
-                            )
+                                    # Strip MikroTik pager prompt from output to avoid agent confusion
+                                    # Match raw output as detection does
+                                    raw_output = re.sub(
+                                        r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
+                                    )
 
-                            shell.send("q")
-                            # Continue collecting output after quitting pager
-                            time.sleep(0.3)
-                            continue
-                        # For other types of input (password, etc.), return and let agent handle
-                        return raw_output, "", 0, awaiting
+                                    shell.send("q")
+                                    # Continue collecting output after quitting pager
+                                    time.sleep(0.3)
+                                    continue
+                                # For other types of input (password, etc.), return and let agent handle
+                                return raw_output, "", 0, awaiting
 
                     # Check for command completion using captured prompt or pattern
                     # Only check after brief idle to avoid false positives from command echo
                     # AND make sure we've seen the command echo (newline)
                     if seen_command_echo and (time.time() - last_recv_time) > 0.2:
                         clean_output = self._strip_ansi(raw_output)
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
                         is_complete, cleaned_output = self._check_prompt_completion(
-                            session_key, raw_output, clean_output
+                            session_key, raw_output, tail_clean
                         )
                     else:
                         is_complete = False
@@ -1526,11 +1568,20 @@ class SSHSessionManager:
                                 time.sleep(0.3)
                                 continue
                             # For other types of input (password, etc.), return and let agent handle
-                            return raw_output, "", 0, awaiting
+                            # Only return awaiting input if prompt isn't already visible
+                            tail_start = echo_end_pos or 0
+                            tail_clean = clean_output[tail_start:]
+                            is_complete, _ = self._check_prompt_completion(
+                                session_key, raw_output, tail_clean
+                            )
+                            if not is_complete:
+                                return raw_output, "", 0, awaiting
 
                         # Only complete on idle timeout if we detect a prompt
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
                         is_complete, cleaned_output = self._check_prompt_completion(
-                            session_key, raw_output, clean_output
+                            session_key, raw_output, tail_clean
                         )
                         if is_complete:
                             logger.debug(

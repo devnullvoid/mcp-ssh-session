@@ -1,4 +1,5 @@
 """Command execution for SSH sessions."""
+import atexit
 import paramiko
 from typing import Dict, Optional, Tuple, Any
 import threading
@@ -22,6 +23,13 @@ class CommandExecutor:
         self._commands: Dict[str, RunningCommand] = {}
         self._executor = ThreadPoolExecutor(max_workers=self._session_manager.MAX_WORKERS, thread_name_prefix="ssh_cmd")
         self._lock = threading.Lock()
+        self._interpreter_exiting = False
+
+        # Mark when the interpreter is shutting down so we can skip late submissions
+        atexit.register(self._mark_interpreter_exit)
+
+    def _mark_interpreter_exit(self):
+        self._interpreter_exiting = True
 
     def execute_command(self, host: str, username: Optional[str] = None,
                        command: str = "", password: Optional[str] = None,
@@ -211,10 +219,20 @@ class CommandExecutor:
                         logger.info(f"Command {command_id} still running after timeout, submitting background monitor")
 
                 # Continue monitoring in background
-                self._executor.submit(
-                    self._continue_monitoring_timeout_background,
-                    command_id, running_cmd, session_key, timeout_occurred_at=time.time()
-                )
+                try:
+                    # Guard against interpreter shutdown or executor shutdown during teardown
+                    if self._interpreter_exiting or getattr(self._executor, "_shutdown", False):
+                        logger.warning(f"Executor shutting down; skip background monitor for {command_id}")
+                        return
+
+                    self._executor.submit(
+                        self._continue_monitoring_timeout_background,
+                        command_id, running_cmd, session_key, timeout_occurred_at=time.time()
+                    )
+                except RuntimeError as submit_err:
+                    logger.debug(
+                        f"Skip background monitor for {command_id}: {submit_err}"
+                    )
                 return
 
             # Normal completion or awaiting input
