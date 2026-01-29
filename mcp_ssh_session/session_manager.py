@@ -16,6 +16,8 @@ try:
 except AttributeError:  # Paramiko 4.x moved it
     from paramiko.ssh_exception import NoValidConnectionsError  # type: ignore
 
+import pyte
+
 from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
 from .file_manager import FileManager
@@ -69,6 +71,10 @@ class SSHSessionManager:
             str, float
         ] = {}  # Track last log time for rate limiting
 
+        # Terminal emulator support (opt-in via feature flag)
+        self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "0") == "1"
+        self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
+
         # Setup optimized logging
         self.logger = get_logger("ssh_session")
         self.context_logger = get_context_logger("ssh_session")
@@ -79,10 +85,50 @@ class SSHSessionManager:
         self.session_diagnostics = SessionDiagnostics(self)
         self.connection_profiles = ConnectionProfileManager(self)
 
+        if self._interactive_mode:
+            self.logger.info("Interactive PTY mode enabled")
         self.logger.info("SSHSessionManager initialized")
 
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
+
+    def _feed_emulator(self, session_key: str, data: str) -> None:
+        """Feed data to terminal emulator if interactive mode is enabled."""
+        if self._interactive_mode and session_key in self._session_emulators:
+            _, stream = self._session_emulators[session_key]
+            stream.feed(data)
+
+    def _get_screen_snapshot(self, session_key: str, max_lines: int = 24) -> dict:
+        """Get a snapshot of the terminal screen state.
+        
+        Returns:
+            dict with keys: lines (list of strings), cursor_x, cursor_y, width, height
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return {
+                "error": "Interactive mode not enabled or session not found",
+                "lines": [],
+                "cursor_x": 0,
+                "cursor_y": 0,
+                "width": 0,
+                "height": 0
+            }
+        
+        screen, _ = self._session_emulators[session_key]
+        
+        # Get screen lines (pyte stores them as a dict keyed by line number)
+        lines = []
+        for y in range(min(max_lines, screen.lines)):
+            line = screen.display[y]
+            lines.append(line.rstrip())
+        
+        return {
+            "lines": lines,
+            "cursor_x": screen.cursor.x,
+            "cursor_y": screen.cursor.y,
+            "width": screen.columns,
+            "height": screen.lines
+        }
 
     def _log_debug_rate_limited(
         self, logger: logging.Logger, key: str, msg: str, interval: float = 5.0
@@ -487,10 +533,21 @@ class SSHSessionManager:
         shell = client.invoke_shell()
         shell.resize_pty(width=100, height=24)
 
+        # Create terminal emulator if interactive mode is enabled
+        if self._interactive_mode:
+            screen = pyte.Screen(100, 24)
+            stream = pyte.Stream(screen)
+            self._session_emulators[session_key] = (screen, stream)
+            logger.debug(f"Created terminal emulator for {session_key}")
+
         time.sleep(1)  # Give shell time to initialize
         initial_output = ""
         if shell.recv_ready():
             initial_output = shell.recv(4096).decode("utf-8", errors="ignore")
+            # Feed to emulator if enabled
+            if self._interactive_mode and session_key in self._session_emulators:
+                _, stream = self._session_emulators[session_key]
+                stream.feed(initial_output)
 
         self._session_shells[session_key] = shell
 
@@ -1102,6 +1159,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -1445,6 +1503,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
@@ -1688,6 +1747,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    self._feed_emulator(session_key, chunk)
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
                     last_output_time = time.time()

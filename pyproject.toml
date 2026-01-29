@@ -21,7 +21,7 @@ classifiers = [
   "Topic :: System :: Networking",
   "Topic :: System :: Systems Administration",
 ]
-dependencies = ["fastmcp", "paramiko>=3.4.0"]
+dependencies = ["fastmcp", "paramiko>=3.4.0", "pyte>=0.8.0"]
 
 [project.scripts]
 mcp-ssh-session = "mcp_ssh_session.__main__:main"
