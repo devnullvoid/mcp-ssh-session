@@ -147,7 +147,16 @@ class SSHSessionManager:
             # Check for shell prompt (has prompt pattern)
             elif session_key in self._session_prompts:
                 prompt = self._session_prompts[session_key]
-                if last_line.endswith(prompt.rstrip()):
+                # Handle wildcard prompts
+                if '*' in prompt or '[' in prompt:
+                    # Convert wildcard to regex
+                    pattern_str = re.escape(prompt).replace(r'\*', '.*?')
+                    pattern_str = pattern_str.replace(r'\[>#\]', '[>#]').replace(r'\[\$#\]', '[$#]')
+                    if re.search(pattern_str + r'\s*$', last_line):
+                        mode = 'shell'
+                    else:
+                        mode = 'unknown'
+                elif last_line.endswith(prompt.rstrip()):
                     mode = 'shell'
                 else:
                     mode = 'unknown'

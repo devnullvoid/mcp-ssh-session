@@ -596,7 +596,7 @@ class CommandExecutor:
                         chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                         if chunk:
                             # Feed to terminal emulator
-                            self._session_manager._feed_emulator(session_key, chunk)
+                            self._session_manager._feed_emulator(cmd.session_key, chunk)
                             
                             # Apply output limiting
                             chunk_to_add, should_continue = output_limiter.add_chunk(chunk)
