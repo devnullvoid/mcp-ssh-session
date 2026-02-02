@@ -1625,7 +1625,8 @@ class SSHSessionManager:
                     awaiting = self._detect_awaiting_input(raw_output, session_key)
                     if awaiting:
                         # Only treat as awaiting input after a brief idle and if prompt isn't present
-                        if (time.time() - last_recv_time) > 0.2:
+                        # Exception: Pagers should be handled immediately to keep stream flowing
+                        if awaiting == "pager" or (time.time() - last_recv_time) > 0.2:
                             clean_output = self._strip_ansi(raw_output)
                             tail_start = echo_end_pos or 0
                             tail_clean = clean_output[tail_start:]
