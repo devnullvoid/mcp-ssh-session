@@ -96,6 +96,58 @@ class TestBugs(unittest.TestCase):
         self.assertEqual(exit_code, 124)
         print("Success: Command correctly waited (timed out) instead of false completion.")
 
+    def test_apt_get_scenario(self):
+        """Test apt-get style output which mimics prompts."""
+        print("\n--- Testing Apt-Get Scenario ---")
+
+        # apt-get often asks "Do you want to continue? [Y/n]" or prints progress like "Processing triggers for man-db (2.10.2-1) ..."
+        # The regex [>#\$]\s*$ typically matches "$", "#", ">".
+        # But some systems might have custom prompts.
+        # The key issue is if the output *ends* with something that matches the prompt pattern.
+
+        def inject():
+            time.sleep(0.5)
+            self.shell.output_queue.append("apt-get install -y something\n")
+            self.shell.output_queue.append("Reading package lists... Done\n")
+            self.shell.output_queue.append("Building dependency tree... Done\n")
+            # Simulate a tricky line that might look like a prompt
+            # e.g. a progress bar or a question
+            self.shell.output_queue.append("Do you want to continue? [Y/n] ")
+
+            # Note: The code has specific logic for "Do you want to continue" in _detect_awaiting_input
+            # which returns 'yes_no'.
+            # If awaiting input is detected, it returns (stdout, "", 0, "yes_no").
+            # But the sentinel logic is checked *after* awaiting input logic in the loop?
+            # Let's check session_manager.py:
+            # 1. Check awaiting_input
+            # 2. Check sentinel
+            # 3. Check prompt completion
+
+            # If "Do you want to continue? [Y/n] " is detected as 'yes_no', it will return early with status 0 and reason.
+            # This is CORRECT behavior for interactive commands - we want the agent to see it and respond.
+
+            # However, if apt-get is running non-interactively (typical for agents), it shouldn't ask.
+            # But let's assume it prints something else that looks like a prompt but isn't.
+            # e.g. "Configuration file '/etc/issue' (last modified > 2024-01-01)"
+            # ending with ">" might trigger prompt detection if prompt pattern is loose.
+
+            time.sleep(0.5)
+            self.shell.output_queue.append("\nConfiguration file '/etc/issue' (last modified > 2024-01-01) >")
+
+        t = threading.Thread(target=inject)
+        t.start()
+
+        with patch.object(self.manager, '_resolve_connection', return_value=({}, "localhost", "user", 22, self.session_key)):
+             stdout, stderr, exit_code, _ = self.manager._execute_standard_command_internal(
+                 self.mock_client, "apt-get install", timeout=3, session_key=self.session_key
+             )
+
+        t.join()
+
+        # Should timeout (124) because sentinel didn't appear, despite ">" at the end.
+        self.assertEqual(exit_code, 124)
+        print("Success: Apt-get simulation correctly waited despite prompt-like characters.")
+
     def test_sentinel_success(self):
         """Test that sentinel correctly detects completion and exit code."""
         print("\n--- Testing Sentinel Success ---")
