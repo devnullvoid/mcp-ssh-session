@@ -141,15 +141,32 @@ class CommandExecutor:
 
         # Atomic check and registration
         with self._lock:
+            # Check for stuck commands and auto-recover if they've been running too long
             for cmd in self._commands.values():
                 if cmd.session_key == session_key and cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
-                    error_msg = (
-                        f"A command is already running or awaiting input in this session ({session_key}).\n"
-                        f"Running Command ID: {cmd.command_id}\n"
-                        f"Running Command Status: {cmd.status.value}"
-                    )
-                    logger.error(error_msg)
-                    raise Exception(error_msg)
+                    # Check if command has been stuck for too long (5 minutes)
+                    cmd_age = (datetime.now() - cmd.start_time).total_seconds()
+                    if cmd_age > 300:  # 5 minutes
+                        logger.warning(
+                            f"Detected stuck command {cmd.command_id} (age: {cmd_age:.0f}s, status: {cmd.status.value}). "
+                            f"Auto-interrupting and allowing new command."
+                        )
+                        try:
+                            cmd.shell.send('\x03')  # Send Ctrl+C
+                            cmd.status = CommandStatus.INTERRUPTED
+                            cmd.end_time = datetime.now()
+                            cmd.stderr += f"\n[Auto-interrupted after {cmd_age:.0f}s]"
+                        except Exception as e:
+                            logger.error(f"Failed to auto-interrupt stuck command: {e}")
+                        # Continue to allow the new command
+                    else:
+                        error_msg = (
+                            f"A command is already running or awaiting input in this session ({session_key}).\n"
+                            f"Running Command ID: {cmd.command_id}\n"
+                            f"Running Command Status: {cmd.status.value}"
+                        )
+                        logger.error(error_msg)
+                        raise Exception(error_msg)
 
             self._commands[command_id] = running_cmd
             logger.debug(f"Registered running command {command_id}")

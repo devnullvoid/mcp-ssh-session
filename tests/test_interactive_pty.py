@@ -8,14 +8,25 @@ from mcp_ssh_session.session_manager import SSHSessionManager
 class TestInteractivePTY:
     """Test interactive PTY mode features."""
 
-    def test_interactive_mode_disabled_by_default(self):
-        """Test that interactive mode is disabled by default."""
-        # Ensure env var is not set
+    def test_interactive_mode_enabled_by_default(self):
+        """Test that interactive mode is enabled by default (v0.2.0+)."""
+        # Ensure env var is not set (should default to enabled)
         os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
+        
+        manager = SSHSessionManager()
+        assert manager._interactive_mode
+        assert len(manager._session_emulators) == 0
+
+    def test_interactive_mode_can_be_disabled(self):
+        """Test that interactive mode can be explicitly disabled."""
+        os.environ["MCP_SSH_INTERACTIVE_MODE"] = "0"
         
         manager = SSHSessionManager()
         assert not manager._interactive_mode
         assert len(manager._session_emulators) == 0
+        
+        # Cleanup
+        os.environ.pop("MCP_SSH_INTERACTIVE_MODE", None)
 
     def test_interactive_mode_enabled_with_flag(self):
         """Test that interactive mode can be enabled."""

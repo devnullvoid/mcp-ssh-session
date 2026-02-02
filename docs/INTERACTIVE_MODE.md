@@ -19,12 +19,18 @@ Interactive PTY mode adds terminal emulation to SSH sessions, enabling better co
 - ⏳ Mode-aware command completion
 - ⏳ Automatic awaiting-input detection improvements
 
-## Enabling Interactive Mode
+## Interactive Mode Status
 
-Set the environment variable before starting the MCP server:
+**As of v0.2.0, Interactive PTY mode is enabled by default.**
+
+This provides better command completion detection and support for interactive programs.
+
+### Disabling Interactive Mode
+
+If you need to disable interactive mode (e.g., for compatibility with older scripts), set the environment variable to "0":
 
 ```bash
-export MCP_SSH_INTERACTIVE_MODE=1
+export MCP_SSH_INTERACTIVE_MODE=0
 uvx mcp-ssh-session
 ```
 
@@ -37,7 +43,7 @@ Or in your MCP client configuration:
       "command": "uvx",
       "args": ["mcp-ssh-session"],
       "env": {
-        "MCP_SSH_INTERACTIVE_MODE": "1"
+        "MCP_SSH_INTERACTIVE_MODE": "0"
       }
     }
   }
@@ -130,7 +136,8 @@ The emulator tracks:
 
 ### Backward Compatibility
 
-- Interactive mode is **opt-in** via environment variable
+- Interactive mode is **enabled by default** as of v0.2.0
+- To disable, set `MCP_SSH_INTERACTIVE_MODE=0`
 - When disabled, behavior is identical to previous versions
 - No performance impact when disabled
 - Existing prompt detection and command completion logic unchanged

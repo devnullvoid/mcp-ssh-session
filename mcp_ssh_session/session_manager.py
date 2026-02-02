@@ -71,8 +71,8 @@ class SSHSessionManager:
             str, float
         ] = {}  # Track last log time for rate limiting
 
-        # Terminal emulator support (opt-in via feature flag)
-        self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "0") == "1"
+        # Terminal emulator support (enabled by default in v0.2.0+)
+        self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "1") == "1"
         self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
         self._session_modes: Dict[str, str] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
 
@@ -1629,8 +1629,31 @@ class SSHSessionManager:
                                     )
 
                                     shell.send("q")
-                                    # Continue collecting output after quitting pager
-                                    time.sleep(0.3)
+                                    # Wait for pager to exit and shell prompt to appear
+                                    # Don't just continue - actively wait for the prompt
+                                    pager_exit_start = time.time()
+                                    pager_exit_timeout = 3.0
+                                    while time.time() - pager_exit_start < pager_exit_timeout:
+                                        time.sleep(0.1)
+                                        if shell.recv_ready():
+                                            chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                                            self._feed_emulator(session_key, chunk)
+                                            limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                                            raw_output += limited_chunk
+                                            if not should_continue:
+                                                return raw_output, "Output limit exceeded", 124, None
+                                            # Check if we now have the shell prompt
+                                            clean_output = self._strip_ansi(raw_output)
+                                            tail_start = echo_end_pos or 0
+                                            tail_clean = clean_output[tail_start:]
+                                            is_complete, cleaned_output = self._check_prompt_completion(
+                                                session_key, raw_output, tail_clean
+                                            )
+                                            if is_complete:
+                                                logger.debug("Shell prompt detected after quitting pager")
+                                                return cleaned_output, "", 0, None
+                                    # If we didn't get prompt, continue normal loop
+                                    logger.debug("Pager quit, continuing to wait for shell prompt")
                                     continue
                                 # For other types of input (password, etc.), return and let agent handle
                                 return raw_output, "", 0, awaiting
@@ -1679,6 +1702,18 @@ class SSHSessionManager:
                                 with self._lock:
                                     self._session_prompts.pop(session_key, None)
                                     self._session_prompt_patterns.pop(session_key, None)
+                                
+                                # Try to clear any stuck state with Ctrl+C
+                                logger.info(f"Sending Ctrl+C to clear stuck state for {session_key}")
+                                try:
+                                    shell.send('\x03')
+                                    time.sleep(0.5)
+                                    # Clear any output from Ctrl+C
+                                    if shell.recv_ready():
+                                        shell.recv(4096)
+                                except Exception as e:
+                                    logger.warning(f"Error sending Ctrl+C: {e}")
+                                
                                 # Try to recapture prompt
                                 self._capture_prompt(session_key, shell)
                                 self._ensure_prompt_pattern(
@@ -1688,6 +1723,23 @@ class SSHSessionManager:
                                 logger.info(
                                     f"Recaptured prompt and regenerated pattern"
                                 )
+                                
+                            # Nuclear option: if we've tried many times, reset the shell
+                            if miss_count > 5:
+                                logger.error(
+                                    f"Prompt detection failed {miss_count} times for {session_key}. "
+                                    f"Shell state may be corrupted. Consider closing and recreating the session."
+                                )
+                                # Mark the shell as needing reset by closing it
+                                # The next command will create a new shell
+                                try:
+                                    shell.close()
+                                except:
+                                    pass
+                                if session_key in self._session_shells:
+                                    del self._session_shells[session_key]
+                                # Return error indicating session needs reset
+                                return raw_output, "Session state corrupted. The session has been reset. Please retry your command.", 1, None
                 else:
                     # No data available - check if we should timeout from inactivity
                     if raw_output and (time.time() - last_recv_time) > idle_timeout:
@@ -1704,10 +1756,38 @@ class SSHSessionManager:
                                 logger.info(
                                     "Automatically handling pager during idle timeout - sending 'q' to quit"
                                 )
+                                
+                                # Strip MikroTik pager prompt from output to avoid agent confusion
+                                raw_output = re.sub(
+                                    r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
+                                )
+                                
                                 shell.send("q")
+                                # Wait for pager to exit and shell prompt to appear
+                                pager_exit_start = time.time()
+                                pager_exit_timeout = 3.0
+                                while time.time() - pager_exit_start < pager_exit_timeout:
+                                    time.sleep(0.1)
+                                    if shell.recv_ready():
+                                        chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                                        self._feed_emulator(session_key, chunk)
+                                        limited_chunk, should_continue = output_limiter.add_chunk(chunk)
+                                        raw_output += limited_chunk
+                                        if not should_continue:
+                                            return raw_output, "Output limit exceeded", 124, None
+                                        # Check if we now have the shell prompt
+                                        clean_output = self._strip_ansi(raw_output)
+                                        tail_start = echo_end_pos or 0
+                                        tail_clean = clean_output[tail_start:]
+                                        is_complete, cleaned_output = self._check_prompt_completion(
+                                            session_key, raw_output, tail_clean
+                                        )
+                                        if is_complete:
+                                            logger.debug("Shell prompt detected after quitting pager (idle)")
+                                            return cleaned_output, "", 0, None
                                 # Reset idle timer and continue collecting
                                 last_recv_time = time.time()
-                                time.sleep(0.3)
+                                logger.debug("Pager quit during idle, continuing to wait for shell prompt")
                                 continue
                             # For other types of input (password, etc.), return and let agent handle
                             # Only return awaiting input if prompt isn't already visible
