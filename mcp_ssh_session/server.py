@@ -357,16 +357,18 @@ def execute_command_async(
 
 
 @mcp.tool()
-def get_command_status(command_id: str) -> str:
+def get_command_status(command_id: str, last_n_lines: Optional[int] = None) -> str:
     """Get the status and output of an async command.
     
     Args:
         command_id: The command ID returned by execute_command_async
+        last_n_lines: Optional limit for stdout lines (from end).
+                      Use this for long-running commands to avoid context window overflow.
     """
     logger = session_manager.logger.getChild('tool_get_status')
-    logger.info(f"Getting status for command ID: {command_id}")
+    logger.info(f"Getting status for command ID: {command_id} (limit={last_n_lines})")
     
-    status = session_manager.get_command_status(command_id)
+    status = session_manager.get_command_status(command_id, last_n_lines=last_n_lines)
     
     if "error" in status:
         logger.error(f"Error getting status for {command_id}: {status['error']}")

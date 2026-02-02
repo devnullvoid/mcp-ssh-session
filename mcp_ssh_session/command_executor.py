@@ -262,8 +262,13 @@ class CommandExecutor:
             # Cleanup old commands
             self._session_manager._cleanup_old_commands()
 
-    def get_command_status(self, command_id: str) -> dict:
-        """Get the status and output of an async command."""
+    def get_command_status(self, command_id: str, last_n_lines: Optional[int] = None) -> dict:
+        """Get the status and output of an async command.
+
+        Args:
+            command_id: Command ID
+            last_n_lines: Optional limit for stdout lines (from end)
+        """
         logger = self.logger.getChild('get_status')
         with self._lock:
             if command_id not in self._commands:
@@ -271,12 +276,21 @@ class CommandExecutor:
                 return {"error": "Command ID not found"}
 
             cmd = self._commands[command_id]
+
+            stdout_data = cmd.stdout
+            if last_n_lines is not None and last_n_lines > 0:
+                lines = stdout_data.splitlines()
+                if len(lines) > last_n_lines:
+                    stdout_data = "\n".join(lines[-last_n_lines:])
+                    # Add indicator that output was truncated
+                    stdout_data = f"... (output truncated to last {last_n_lines} lines) ...\n{stdout_data}"
+
             status_payload = {
                 "command_id": cmd.command_id,
                 "session_key": cmd.session_key,
                 "command": cmd.command,
                 "status": cmd.status.value,
-                "stdout": cmd.stdout,
+                "stdout": stdout_data,
                 "stderr": cmd.stderr,
                 "exit_code": cmd.exit_code,
                 "start_time": cmd.start_time.isoformat(),
