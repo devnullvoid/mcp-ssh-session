@@ -830,6 +830,18 @@ class SSHSessionManager:
                         output = shell.recv(4096).decode("utf-8", errors="ignore")
                         marker = None  # Disable marker processing
 
+                        # Check if we can identify the device type from this fallback output
+                        output_lower = output.lower()
+                        if (
+                            "mikrotik" in output_lower
+                            or "routeros" in output_lower
+                            or re.search(r"\[.+@.+\] >", output)
+                        ):
+                            logger.info(
+                                f"Detected MikroTik device from fallback prompt for {session_key}"
+                            )
+                            self._session_shell_types[session_key] = "mikrotik"
+
             if not output:
                 logger.warning(f"No output received for {session_key}")
                 return None
@@ -989,6 +1001,20 @@ class SSHSessionManager:
             # Fish prompts typically have context before the prompt character
             pattern = re.compile(r"(\S+\s+)?[>#\$]\s*$")
             logger.debug("Using Fish shell prompt pattern")
+        elif shell_type in (
+            "cisco",
+            "juniper",
+            "fortinet",
+            "arista",
+            "paloalto",
+            "checkpoint",
+            "mikrotik",
+            "edgeswitch",
+            "vyos",
+            "openwrt",
+            "network_device",
+        ):
+            logger.debug(f"Skipping PS1 check for network device type: {shell_type}")
         else:
             # Try to read $PS1 from interactive shell (preferred) or exec_command (fallback)
             if shell:

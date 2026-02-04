@@ -72,7 +72,7 @@ Latest test run (2026-01-29):
 - ✅ Interactive PTY test suite: 16/16 passing
   - 8 basic functionality tests
   - 8 mode inference tests
-- ✅ Overall test suite: 25/26 passing (1 pre-existing Mikrotik failure)
+- ✅ Overall test suite: 27/54 passed (27 skipped)
 - ✅ No regressions from Phase 3-4 implementation
 
 ### Test Results
@@ -117,6 +117,11 @@ Ran comprehensive tests on 2026-01-28:
 ## Known Issues
 
 None - all tests passing.
+
+## Recent Fixes (2026-02-03)
+- Fixed MikroTik initial connection bug where device type was not detected during prompt fallback.
+- Optimized prompt detection by skipping incompatible `echo $PS1` checks for network devices.
+- Verified with reproduction test and existing test suite.
 
 ## Next Steps
 
