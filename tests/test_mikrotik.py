@@ -142,12 +142,9 @@ def test_mikrotik_pager_handling_mock(mock_ssh_client):
     # Mock resolving connection to bypass config lookup
     with patch.object(
         manager, "_resolve_connection", return_value=({}, host, user, port, session_key)
-    ), patch.object(manager, "_build_device_profile") as mock_profile:
+    ):
         # Pre-seed prompt to avoid prompt detection phase which might complicate test
-        import re
         manager._session_prompts[session_key] = "[jon@core-rtr-01] >"
-        # Ensure we have a pattern so it doesn't try to auto-detect and send sentinels
-        manager._session_prompt_patterns[session_key] = re.compile(re.escape("[jon@core-rtr-01] >") + r"\s*$")
 
         # Execute command that triggers pager
         command = "/interface bridge port print"

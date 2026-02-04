@@ -79,9 +79,13 @@ Interactive PTY Tests: 16/16 passing
   - 8 basic functionality tests
   - 8 mode inference tests
 
-Overall Test Suite: 25/26 passing
-  - 1 pre-existing Mikrotik failure (unrelated)
+Overall Test Suite: 27/54 passed (27 skipped)
   - No regressions from new implementation
+  - Fixed pre-existing MikroTik initial connection bug
+
+### Test Coverage
+
+**Mode Detection:**
 ```
 
 ### Test Coverage
