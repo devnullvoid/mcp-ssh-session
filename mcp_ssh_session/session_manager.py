@@ -1593,9 +1593,27 @@ class SSHSessionManager:
                 except Exception:
                     pass
 
-            # Send command without sentinel - rely on prompt detection
+            # Check shell type to decide on sentinel usage
+            shell_type = self._session_shell_types.get(session_key, "unknown")
+            logger.debug(f"Shell type for {session_key}: {shell_type}")
+            is_unix = shell_type in ("unix_shell", "unknown")
+
+            # Use sentinel only for Unix-like shells
+            sentinel = None
+            command_to_send = command
+            if is_unix:
+                marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
+                command_to_send = self._build_sentinel_command(marker, "")
+                # Inject user command before sentinel
+                # The _build_sentinel_command creates:
+                # __mcp_status=$?; printf '\n{marker}%d\n' "$__mcp_status" ...
+                # We need to prepend the actual command
+                command_to_send = f"{command}; {command_to_send}"
+                sentinel = marker
+                logger.debug(f"Using sentinel marker: {sentinel}")
+
             logger.info(f"Executing command on {session_key}: {command}")
-            shell.send(command + "\n")
+            shell.send(command_to_send + "\n")
             time.sleep(0.3)
 
             output_limiter = OutputLimiter()
@@ -1633,7 +1651,8 @@ class SSHSessionManager:
                     awaiting = self._detect_awaiting_input(raw_output, session_key)
                     if awaiting:
                         # Only treat as awaiting input after a brief idle and if prompt isn't present
-                        if (time.time() - last_recv_time) > 0.2:
+                        # Exception: Pagers should be handled immediately to keep stream flowing
+                        if awaiting == "pager" or (time.time() - last_recv_time) > 0.2:
                             clean_output = self._strip_ansi(raw_output)
                             tail_start = echo_end_pos or 0
                             tail_clean = clean_output[tail_start:]
@@ -1684,6 +1703,29 @@ class SSHSessionManager:
                                 # For other types of input (password, etc.), return and let agent handle
                                 return raw_output, "", 0, awaiting
 
+                    # Check for sentinel (Unix shells)
+                    if sentinel and sentinel in raw_output:
+                        logger.debug("Sentinel detected")
+                        # Extract exit code and clean output
+                        clean_output = self._strip_ansi(raw_output)
+
+                        # Find sentinel and exit code
+                        # Pattern: marker + digits
+                        sentinel_pattern = re.compile(re.escape(sentinel) + r"(\d+)")
+                        match = sentinel_pattern.search(clean_output)
+                        if match:
+                            exit_code = int(match.group(1))
+
+                            # Clean up output: remove everything from sentinel onwards using the match position
+                            # This avoids truncating at the command echo which also contains the sentinel string
+
+                            # We use clean_output for truncation to ensure accurate regex index matching
+                            # match.start() is the index of the sentinel in clean_output
+                            final_output = clean_output[:match.start()]
+
+                            # We should return the clean output directly
+                            return final_output.strip(), "", exit_code, None
+
                     # Check for command completion using captured prompt or pattern
                     # Only check after brief idle to avoid false positives from command echo
                     # AND make sure we've seen the command echo (newline)
@@ -1691,9 +1733,20 @@ class SSHSessionManager:
                         clean_output = self._strip_ansi(raw_output)
                         tail_start = echo_end_pos or 0
                         tail_clean = clean_output[tail_start:]
+
                         is_complete, cleaned_output = self._check_prompt_completion(
                             session_key, raw_output, tail_clean
                         )
+
+                        # If sentinel mode is on, we ignore simple prompt matching unless
+                        # we are really sure or it's been a long time?
+                        # Actually, the bug is "Cost is 10$" triggers prompt match.
+                        # If we have a sentinel, "Cost is 10$" will appear, but sentinel won't.
+                        # So we should IGNORE is_complete if sentinel is active and sentinel not found.
+                        if sentinel and is_complete:
+                             # Logic: If sentinel is used, we trust sentinel.
+                             # We DO NOT return on prompt detection alone to fix the bug.
+                             is_complete = False
                     else:
                         is_complete = False
                         cleaned_output = ""
@@ -1728,7 +1781,7 @@ class SSHSessionManager:
                                 with self._lock:
                                     self._session_prompts.pop(session_key, None)
                                     self._session_prompt_patterns.pop(session_key, None)
-                                
+
                                 # Try to clear any stuck state with Ctrl+C
                                 logger.info(f"Sending Ctrl+C to clear stuck state for {session_key}")
                                 try:
@@ -1739,7 +1792,7 @@ class SSHSessionManager:
                                         shell.recv(4096)
                                 except Exception as e:
                                     logger.warning(f"Error sending Ctrl+C: {e}")
-                                
+
                                 # Try to recapture prompt
                                 self._capture_prompt(session_key, shell)
                                 self._ensure_prompt_pattern(
@@ -1749,7 +1802,7 @@ class SSHSessionManager:
                                 logger.info(
                                     f"Recaptured prompt and regenerated pattern"
                                 )
-                                
+
                             # Nuclear option: if we've tried many times, reset the shell
                             if miss_count > 5:
                                 logger.error(
@@ -1782,12 +1835,12 @@ class SSHSessionManager:
                                 logger.info(
                                     "Automatically handling pager during idle timeout - sending 'q' to quit"
                                 )
-                                
+
                                 # Strip MikroTik pager prompt from output to avoid agent confusion
                                 raw_output = re.sub(
                                     r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
                                 )
-                                
+
                                 shell.send("q")
                                 # Wait for pager to exit and shell prompt to appear
                                 pager_exit_start = time.time()
@@ -1836,6 +1889,24 @@ class SSHSessionManager:
                                 "Prompt found in cleaned output during idle timeout"
                             )
 
+                            # If sentinel is active, verify sentinel presence even on idle timeout
+                            if sentinel:
+                                if sentinel in raw_output:
+                                     # Sentinel found, we can proceed
+                                     # Logic handled in main loop, but here we are in idle block
+                                     # Let main loop handle it in next iteration (idle doesn't break loop unless we return)
+                                     pass
+                                else:
+                                     # Sentinel NOT found, but prompt found.
+                                     # This is the ambiguous case.
+                                     # If we return here, we risk the bug.
+                                     # If we don't, we risk hanging if sentinel is lost.
+                                     # Given the bug report, we MUST prioritize avoiding false positives.
+                                     # So we ignore the prompt if sentinel is missing.
+                                     logger.debug("Sentinel active but not found - ignoring prompt detection on idle")
+                                     is_complete = False
+
+                        if is_complete:
                             # If this was a context-changing command, recapture the prompt
                             if context_changing:
                                 logger.info(
@@ -1845,7 +1916,7 @@ class SSHSessionManager:
                                     self._session_prompts.pop(session_key, None)
                                 self._capture_prompt(session_key, shell)
 
-                        return cleaned_output, "", 0, None
+                            return cleaned_output, "", 0, None
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")
