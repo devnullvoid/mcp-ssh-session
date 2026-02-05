@@ -28,7 +28,7 @@ class MockShell:
             # Simulating quitting pager
             # Mikrotik might clear line or just show prompt
             # We simulate prompt appearing after q
-            self.output_queue.append("\r\n[jon@core-rtr-01] > ")
+            self.output_queue.append("\r\n[jon@MikroTik] > ")
             self._recv_ready = True
         elif data.strip() == "/interface bridge port print":
             print("[MOCK SHELL] Executing Mikrotik command that triggers pager")
@@ -45,7 +45,7 @@ class MockShell:
         elif data == "\n":
             print("[MOCK SHELL] Sending newline/prompt")
             # Initial prompt check or just enter
-            self.output_queue.append("\r\n[jon@core-rtr-01] > ")
+            self.output_queue.append("\r\n[jon@MikroTik] > ")
             self._recv_ready = True
 
     def recv_ready(self):
@@ -92,7 +92,7 @@ def streaming_manager(mock_ssh_client):
 
     # Prime session metadata used by the executor
     manager._session_shell_types[session_key] = "mikrotik"
-    manager._session_prompts[session_key] = "[jon@core-rtr-01] >"
+    manager._session_prompts[session_key] = "[jon@MikroTik] >"
 
     shell = mock_ssh_client.invoke_shell.return_value
 
@@ -144,7 +144,7 @@ def test_mikrotik_pager_handling_mock(mock_ssh_client):
         manager, "_resolve_connection", return_value=({}, host, user, port, session_key)
     ):
         # Pre-seed prompt to avoid prompt detection phase which might complicate test
-        manager._session_prompts[session_key] = "[jon@core-rtr-01] >"
+        manager._session_prompts[session_key] = "[jon@MikroTik] >"
 
         # Execute command that triggers pager
         command = "/interface bridge port print"

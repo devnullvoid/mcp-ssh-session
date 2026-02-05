@@ -609,14 +609,23 @@ class SSHSessionManager:
             self._session_emulators[session_key] = (screen, stream)
             logger.debug(f"Created terminal emulator for {session_key}")
 
-        time.sleep(1)  # Give shell time to initialize
+        time.sleep(2)  # Give shell time to initialize
         initial_output = ""
-        if shell.recv_ready():
-            initial_output = shell.recv(4096).decode("utf-8", errors="ignore")
-            # Feed to emulator if enabled
-            if self._interactive_mode and session_key in self._session_emulators:
-                _, stream = self._session_emulators[session_key]
-                stream.feed(initial_output)
+        # Wait up to 5 seconds for initial output/banner
+        start_wait = time.time()
+        while time.time() - start_wait < 5.0:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                logger.debug(f"Initial shell output chunk: {repr(chunk)}")
+                initial_output += chunk
+                # Feed to emulator if enabled
+                if self._interactive_mode and session_key in self._session_emulators:
+                    _, stream = self._session_emulators[session_key]
+                    stream.feed(chunk)
+            elif initial_output:
+                # We got some output and now it's quiet, maybe it's done
+                break
+            time.sleep(0.2)
 
         self._session_shells[session_key] = shell
 
@@ -791,6 +800,7 @@ class SSHSessionManager:
 
                 if shell.recv_ready():
                     output = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Capture prompt received: {repr(output)}")
             else:
                 # Unix/Linux shells: try echo with marker
                 marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
@@ -799,11 +809,12 @@ class SSHSessionManager:
 
                 # Collect output
                 start_time = time.time()
-                timeout = 3.0
+                timeout = 10.0
 
                 while time.time() - start_time < timeout:
                     if shell.recv_ready():
                         chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                        logger.debug(f"Capture prompt received chunk: {repr(chunk)}")
                         output += chunk
 
                         # Check if we've received the marker and subsequent prompt
@@ -825,22 +836,33 @@ class SSHSessionManager:
                     )
                     # Try simple newline approach
                     shell.send("\n")
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     if shell.recv_ready():
-                        output = shell.recv(4096).decode("utf-8", errors="ignore")
+                        fallback_output = shell.recv(4096).decode("utf-8", errors="ignore")
+                        logger.debug(f"Capture prompt fallback received: {repr(fallback_output)}")
+                        output += fallback_output
                         marker = None  # Disable marker processing
 
-                        # Check if we can identify the device type from this fallback output
-                        output_lower = output.lower()
-                        if (
-                            "mikrotik" in output_lower
-                            or "routeros" in output_lower
-                            or re.search(r"\[.+@.+\] >", output)
-                        ):
-                            logger.info(
-                                f"Detected MikroTik device from fallback prompt for {session_key}"
-                            )
-                            self._session_shell_types[session_key] = "mikrotik"
+                    # Check if we can identify the device type from the accumulated output
+                    output_lower = output.lower()
+                    if (
+                        "mikrotik" in output_lower
+                        or "routeros" in output_lower
+                        or re.search(r"\[.+@.+\]\s*>", output)
+                    ):
+                        logger.info(
+                            f"Detected MikroTik device from fallback output for {session_key}"
+                        )
+                        self._session_shell_types[session_key] = "mikrotik"
+                    elif "edgeswitch" in output_lower or "ubiquiti" in output_lower:
+                        self._session_shell_types[session_key] = "edgeswitch"
+                    elif any(c in output_lower for c in ["cisco", "ios", ">", "#"]):
+                        # Very basic check for other network devices
+                        if not any(s in output_lower for s in ["bash", "zsh", "fish"]):
+                             logger.info(f"Suspect network device for {session_key} based on prompt/output")
+                             # Don't set to mikrotik, but maybe generic network_device
+                             if device_type == "unknown":
+                                 self._session_shell_types[session_key] = "network_device"
 
             if not output:
                 logger.warning(f"No output received for {session_key}")
@@ -1254,6 +1276,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
@@ -1596,7 +1619,7 @@ class SSHSessionManager:
             # Check shell type to decide on sentinel usage
             shell_type = self._session_shell_types.get(session_key, "unknown")
             logger.debug(f"Shell type for {session_key}: {shell_type}")
-            is_unix = shell_type in ("unix_shell", "unknown")
+            is_unix = shell_type == "unix_shell"
 
             # Use sentinel only for Unix-like shells
             sentinel = None
@@ -1630,6 +1653,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -1682,6 +1706,7 @@ class SSHSessionManager:
                                         time.sleep(0.1)
                                         if shell.recv_ready():
                                             chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                                            logger.logger.debug(f"Received chunk (pager): {repr(chunk)}")
                                             self._feed_emulator(session_key, chunk)
                                             limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                                             raw_output += limited_chunk
@@ -1849,6 +1874,7 @@ class SSHSessionManager:
                                     time.sleep(0.1)
                                     if shell.recv_ready():
                                         chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                                        logger.logger.debug(f"Received chunk (idle-pager): {repr(chunk)}")
                                         self._feed_emulator(session_key, chunk)
                                         limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                                         raw_output += limited_chunk
@@ -2007,6 +2033,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
