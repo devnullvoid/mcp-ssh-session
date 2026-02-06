@@ -611,7 +611,7 @@ class SSHSessionManager:
 
         time.sleep(2)  # Give shell time to initialize
         initial_output = ""
-        # Wait up to 5 seconds for initial output/banner
+        # Wait up to 5 seconds for initial output/banner (some routers are slow)
         start_wait = time.time()
         while time.time() - start_wait < 5.0:
             if shell.recv_ready():
@@ -622,8 +622,8 @@ class SSHSessionManager:
                 if self._interactive_mode and session_key in self._session_emulators:
                     _, stream = self._session_emulators[session_key]
                     stream.feed(chunk)
-            elif initial_output:
-                # We got some output and now it's quiet, maybe it's done
+            elif initial_output and (time.time() - start_wait > 1.0):
+                # We got some output and it's quiet, maybe it's done
                 break
             time.sleep(0.2)
 
