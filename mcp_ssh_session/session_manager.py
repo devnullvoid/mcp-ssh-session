@@ -913,6 +913,7 @@ class SSHSessionManager:
         Makes prompts flexible for:
         - Directory changes: [user@host ~/dir]$ -> [user@host *]$
         - Path changes: user@host:/path$ -> user@host:*$
+        - MikroTik submenus: [user@host] /ip> -> [user@host] *>
 
         Args:
             prompt: The literal captured prompt
@@ -923,23 +924,26 @@ class SSHSessionManager:
         """
         original = prompt
 
-        # Pattern 1: [user@host directory]$ or [user@host directory]#
-        # Generalize: [user@host *]$ or [user@host *]#
+        # Pattern 1: [user@host] path> (MikroTik style)
+        if "[" in prompt and "]" in prompt and "@" in prompt:
+            # Match bracketed part and whatever follows until prompt char
+            match = re.search(r"^(\[[^\]]*@[^\]]*\]).*?([>#\$%]\s*)$", prompt)
+            if match:
+                return match.group(1) + "*" + match.group(2)
+
+        # Pattern 2: [user@host directory]$ or [user@host directory]# (Standard Unix style)
         if "[" in prompt and "]" in prompt and ("@" in prompt or " " in prompt):
-            # Replace content between last space/@ and ] with *
-            # Match [anything] followed by prompt char
             match = re.search(r"(\[[^\]]*[@\s][^\]]*)\]([>#\$%])", prompt)
             if match:
                 # Find the last space or path separator in the bracket
                 bracket_content = match.group(1)
                 prompt_char = match.group(2)
-                # Replace everything after last space with *
                 if " " in bracket_content:
                     parts = bracket_content.rsplit(" ", 1)
-                    generalized = parts[0] + " *]" + prompt_char
-                    return generalized
+                    return parts[0] + " *]" + prompt_char
+                return bracket_content + "]" + prompt_char
 
-        # Pattern 2: user@host:/path$ or user@host:~$ or user@host:~/path$
+        # Pattern 3: user@host:/path$ or user@host:~$ or user@host:~/path$
         # Generalize: user@host:*$ or user@host:*#
         if ":" in prompt and "@" in prompt:
             # Replace path after : with *
@@ -960,7 +964,7 @@ class SSHSessionManager:
                         generalized = parts[0] + ":*" + prompt_char
                         return generalized
 
-        # Pattern 3: user@host directory$ or user@host directory#
+        # Pattern 4: user@host directory$ or user@host directory#
         # Generalize: user@host *$ or user@host *#
         if "@" in prompt and " " in prompt:
             match = re.search(r"(@[^\s]+\s+)(.+)([>#\$%]\s*)$", prompt)
@@ -972,19 +976,8 @@ class SSHSessionManager:
                 generalized = user_part + prefix + "*" + prompt_char
                 return generalized
 
-        # Pattern 4: Simple prompts with just directory before prompt char
-        # ~/dir$ -> *$ or /path$ -> *$
-        # DISABLED: Too dangerous, matches any output ending in prompt char
-        # if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
-        #     match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
-        #     if match:
-        #         prompt_char = match.group(2)
-        #         generalized = '*' + prompt_char
-        #         return generalized
-
         # No generalization needed
         return prompt
-
     def _ensure_shell_type(self, session_key: str, client: paramiko.SSHClient) -> str:
         """Legacy method - now handled by _build_device_profile."""
         if session_key in self._session_shell_types:
@@ -1276,7 +1269,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
-                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
@@ -1578,6 +1571,8 @@ class SSHSessionManager:
             r"^screen\b",  # screen
             r"^tmux\b",  # tmux
             r"^(bash|sh|zsh|fish|ksh|csh|tcsh)\s*$",  # spawning new shell
+            r"^/\.?\.\b",  # MikroTik menu up (/.. or /.)
+            r"^/[a-z-]+(\s+[a-z-]+)*$",  # MikroTik menu change (/ip, /interface bridge, etc.)
         ]
 
         for pattern in context_changers:
@@ -1653,7 +1648,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
-                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -1706,7 +1701,7 @@ class SSHSessionManager:
                                         time.sleep(0.1)
                                         if shell.recv_ready():
                                             chunk = shell.recv(4096).decode("utf-8", errors="ignore")
-                                            logger.logger.debug(f"Received chunk (pager): {repr(chunk)}")
+                                            logger.debug(f"Received chunk (pager): {repr(chunk)}")
                                             self._feed_emulator(session_key, chunk)
                                             limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                                             raw_output += limited_chunk
@@ -1874,7 +1869,7 @@ class SSHSessionManager:
                                     time.sleep(0.1)
                                     if shell.recv_ready():
                                         chunk = shell.recv(4096).decode("utf-8", errors="ignore")
-                                        logger.logger.debug(f"Received chunk (idle-pager): {repr(chunk)}")
+                                        logger.debug(f"Received chunk (idle-pager): {repr(chunk)}")
                                         self._feed_emulator(session_key, chunk)
                                         limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                                         raw_output += limited_chunk
@@ -2033,7 +2028,7 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
-                    logger.logger.debug(f"Received chunk: {repr(chunk)}")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
                     self._feed_emulator(session_key, chunk)
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
