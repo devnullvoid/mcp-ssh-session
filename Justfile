@@ -40,40 +40,52 @@ test:
 
     uv run pytest tests/ -v -s
 
-# Convenience recipe: Run basic integration tests
-# Usage: just test-basic host=myhost user=myuser [password=pass] [keyfile=~/.ssh/id_rsa] [port=22]
-test-basic host user password="" keyfile="" port="22":
+# Convenience recipe: Run basic integration tests (excludes network/mikrotik tests)
+# Usage: just test-basic host=myhost [user=myuser] [password=pass] [keyfile=~/.ssh/id_rsa] [port=22]
+test-basic host user="" password="" keyfile="" port="22":
     #!/usr/bin/env bash
     set -euo pipefail
     export SSH_TEST_HOST="{{host}}"
-    export SSH_TEST_USER="{{user}}"
+    [ -n "{{user}}" ] && export SSH_TEST_USER="{{user}}"
     [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
     [ -n "{{keyfile}}" ] && export SSH_TEST_KEY_FILE="{{keyfile}}"
     [ "{{port}}" != "22" ] && export SSH_TEST_PORT="{{port}}"
-    just test
+    uv run pytest tests/ -v -s --ignore=tests/test_mikrotik.py --ignore=tests/test_network_devices.py
 
 # Convenience recipe: Run tests with sudo password
-# Usage: just test-sudo host=myhost user=myuser sudo_password=pass [password=pass] [keyfile=~/.ssh/id_rsa]
-test-sudo host user sudo_password password="" keyfile="":
+# Usage: just test-sudo host=myhost sudo_password=pass [user=myuser] [password=pass] [keyfile=~/.ssh/id_rsa]
+test-sudo host sudo_password user="" password="" keyfile="":
     #!/usr/bin/env bash
     set -euo pipefail
     export SSH_TEST_HOST="{{host}}"
-    export SSH_TEST_USER="{{user}}"
+    [ -n "{{user}}" ] && export SSH_TEST_USER="{{user}}"
     export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
     [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
     [ -n "{{keyfile}}" ] && export SSH_TEST_KEY_FILE="{{keyfile}}"
-    just test
+    uv run pytest tests/ -v -s --ignore=tests/test_mikrotik.py --ignore=tests/test_network_devices.py
 
 # Convenience recipe: Run network device tests (with enable password)
-# Usage: just test-network host=router user=admin password=cisco enable_password=enable
-test-network host user password enable_password:
+# Usage: just test-network host=router password=cisco enable_password=enable [user=admin]
+test-network host password enable_password user="":
     #!/usr/bin/env bash
     set -euo pipefail
     export SSH_TEST_HOST="{{host}}"
-    export SSH_TEST_USER="{{user}}"
+    [ -n "{{user}}" ] && export SSH_TEST_USER="{{user}}"
     export SSH_TEST_PASSWORD="{{password}}"
     export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
-    just test
+    uv run pytest tests/test_network_devices.py -v -s
+
+# Convenience recipe: Run concurrency tests
+# Usage: just test-concurrency host=myhost sudo_password=pass [user=myuser] [password=pass] [keyfile=~/.ssh/id_rsa]
+test-concurrency host sudo_password user="" password="" keyfile="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export SSH_TEST_HOST="{{host}}"
+    [ -n "{{user}}" ] && export SSH_TEST_USER="{{user}}"
+    export SSH_TEST_SUDO_PASSWORD="{{sudo_password}}"
+    [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
+    [ -n "{{keyfile}}" ] && export SSH_TEST_KEY_FILE="{{keyfile}}"
+    uv run pytest tests/test_concurrency.py -v -s
 
 # Run the MCP SSH Session server
 run:
@@ -93,3 +105,14 @@ clean:
     find . -name "*.pyc" -exec rm -f {} +
     find . -name "*.log" -exec rm -f {} +
     @echo "Cleanup complete."
+# Convenience recipe: Run Mikrotik tests
+# Usage: just test-mikrotik host=router [user=] [password=cisco] [enable_password=enable] [port=22]
+test-mikrotik host user="" password="" enable_password="" port="22":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export SSH_TEST_HOST="{{host}}"
+    [ -n "{{user}}" ] && export SSH_TEST_USER="{{user}}"
+    [ -n "{{password}}" ] && export SSH_TEST_PASSWORD="{{password}}"
+    [ -n "{{enable_password}}" ] && export SSH_TEST_ENABLE_PASSWORD="{{enable_password}}"
+    [ "{{port}}" != "22" ] && export SSH_TEST_PORT="{{port}}"
+    uv run pytest tests/test_mikrotik.py -v -s

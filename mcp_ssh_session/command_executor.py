@@ -1,4 +1,5 @@
 """Command execution for SSH sessions."""
+import atexit
 import paramiko
 from typing import Dict, Optional, Tuple, Any
 import threading
@@ -22,6 +23,13 @@ class CommandExecutor:
         self._commands: Dict[str, RunningCommand] = {}
         self._executor = ThreadPoolExecutor(max_workers=self._session_manager.MAX_WORKERS, thread_name_prefix="ssh_cmd")
         self._lock = threading.Lock()
+        self._interpreter_exiting = False
+
+        # Mark when the interpreter is shutting down so we can skip late submissions
+        atexit.register(self._mark_interpreter_exit)
+
+    def _mark_interpreter_exit(self):
+        self._interpreter_exiting = True
 
     def execute_command(self, host: str, username: Optional[str] = None,
                        command: str = "", password: Optional[str] = None,
@@ -133,15 +141,32 @@ class CommandExecutor:
 
         # Atomic check and registration
         with self._lock:
+            # Check for stuck commands and auto-recover if they've been running too long
             for cmd in self._commands.values():
                 if cmd.session_key == session_key and cmd.status in (CommandStatus.RUNNING, CommandStatus.AWAITING_INPUT):
-                    error_msg = (
-                        f"A command is already running or awaiting input in this session ({session_key}).\n"
-                        f"Running Command ID: {cmd.command_id}\n"
-                        f"Running Command Status: {cmd.status.value}"
-                    )
-                    logger.error(error_msg)
-                    raise Exception(error_msg)
+                    # Check if command has been stuck for too long (5 minutes)
+                    cmd_age = (datetime.now() - cmd.start_time).total_seconds()
+                    if cmd_age > 300:  # 5 minutes
+                        logger.warning(
+                            f"Detected stuck command {cmd.command_id} (age: {cmd_age:.0f}s, status: {cmd.status.value}). "
+                            f"Auto-interrupting and allowing new command."
+                        )
+                        try:
+                            cmd.shell.send('\x03')  # Send Ctrl+C
+                            cmd.status = CommandStatus.INTERRUPTED
+                            cmd.end_time = datetime.now()
+                            cmd.stderr += f"\n[Auto-interrupted after {cmd_age:.0f}s]"
+                        except Exception as e:
+                            logger.error(f"Failed to auto-interrupt stuck command: {e}")
+                        # Continue to allow the new command
+                    else:
+                        error_msg = (
+                            f"A command is already running or awaiting input in this session ({session_key}).\n"
+                            f"Running Command ID: {cmd.command_id}\n"
+                            f"Running Command Status: {cmd.status.value}"
+                        )
+                        logger.error(error_msg)
+                        raise Exception(error_msg)
 
             self._commands[command_id] = running_cmd
             logger.debug(f"Registered running command {command_id}")
@@ -211,10 +236,20 @@ class CommandExecutor:
                         logger.info(f"Command {command_id} still running after timeout, submitting background monitor")
 
                 # Continue monitoring in background
-                self._executor.submit(
-                    self._continue_monitoring_timeout_background,
-                    command_id, running_cmd, session_key, timeout_occurred_at=time.time()
-                )
+                try:
+                    # Guard against interpreter shutdown or executor shutdown during teardown
+                    if self._interpreter_exiting or getattr(self._executor, "_shutdown", False):
+                        logger.warning(f"Executor shutting down; skip background monitor for {command_id}")
+                        return
+
+                    self._executor.submit(
+                        self._continue_monitoring_timeout_background,
+                        command_id, running_cmd, session_key, timeout_occurred_at=time.time()
+                    )
+                except RuntimeError as submit_err:
+                    logger.debug(
+                        f"Skip background monitor for {command_id}: {submit_err}"
+                    )
                 return
 
             # Normal completion or awaiting input
@@ -447,6 +482,9 @@ class CommandExecutor:
                     if cmd.shell.recv_ready():
                         chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                         if chunk:
+                            # Feed to terminal emulator
+                            self._session_manager._feed_emulator(session_key, chunk)
+                            
                             # Apply output limiting
                             chunk_to_add, should_continue = output_limiter.add_chunk(chunk)
                             
@@ -471,7 +509,7 @@ class CommandExecutor:
                                 last_log_time = time.time()
 
                             # Check for interactive prompts
-                            awaiting = self._session_manager._detect_awaiting_input(cmd.stdout)
+                            awaiting = self._session_manager._detect_awaiting_input(cmd.stdout, session_key)
                             if awaiting:
                                 logger.info(f"[TIMEOUT_MONITOR_AWAITING] Command awaiting input: {awaiting}")
                                 with self._lock:
@@ -574,6 +612,9 @@ class CommandExecutor:
                     if cmd.shell.recv_ready():
                         chunk = cmd.shell.recv(65535).decode('utf-8', errors='replace')
                         if chunk:
+                            # Feed to terminal emulator
+                            self._session_manager._feed_emulator(cmd.session_key, chunk)
+                            
                             # Apply output limiting
                             chunk_to_add, should_continue = output_limiter.add_chunk(chunk)
 

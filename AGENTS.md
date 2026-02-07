@@ -22,6 +22,8 @@ This MCP server provides tools for AI agents to:
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 - **Interactive Shell Handling**: Detects and responds to password prompts automatically
 - **Command Interruption**: Allows for gracefully stopping long-running or stuck commands by sending a Ctrl+C signal to the active session
+- **Interactive PTY Mode** (v0.2.0+): Terminal emulation enabled by default for better command completion detection and interactive program support
+- **Automatic Session Recovery**: Detects and recovers from corrupted session state caused by stuck commands or pager issues
 
 ## Installation
 
@@ -201,6 +203,33 @@ Commands complete when either:
 
 ### MCP Server
 Built with FastMCP, exposing SSH functionality as MCP tools that can be called by AI agents.
+
+### Interactive PTY Mode (v0.2.0+)
+
+Interactive PTY mode is **enabled by default** starting with v0.2.0. This provides:
+
+- **Better command completion detection**: Uses terminal emulation to accurately detect when commands complete
+- **Interactive program support**: Better handling of vim, less, top, and other interactive programs
+- **Mode detection**: Automatically detects when running in editors, pagers, or password prompts
+- **Automatic pager handling**: Automatically quits pagers (less, more, MikroTik) by sending 'q'
+
+To disable interactive mode, set `MCP_SSH_INTERACTIVE_MODE=0`.
+
+### Session Recovery
+
+The session manager includes automatic recovery mechanisms:
+
+- **Prompt detection failure recovery**: If prompt detection fails repeatedly, the system:
+  1. Sends Ctrl+C to clear any stuck state
+  2. Recaptures the prompt
+  3. If still failing after 5 attempts, automatically resets the shell
+  
+- **Stuck command detection**: Commands running for more than 5 minutes are automatically interrupted
+
+- **Pager handling**: When a pager is detected, the system:
+  1. Sends 'q' to quit the pager
+  2. Actively waits for the shell prompt to reappear
+  3. Only returns when the command is truly complete
 
 ## Security Considerations
 

@@ -53,3 +53,4 @@ htmlcov/
 
 # Local test files
 test_local.py
+docs/local/
