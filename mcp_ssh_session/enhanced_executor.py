@@ -41,7 +41,13 @@ class EnhancedCommandExecutor:
         
         try:
             # Validate command
-            is_valid, error_msg = self.session_manager._command_validator.validate_command(command)
+            is_valid, error_msg = self.session_manager._command_validator.validate_command(
+                command,
+                pty_aware=(
+                    self.session_manager._interactive_mode
+                    and self.session_manager._pty_aware_validation
+                ),
+            )
             if not is_valid:
                 self.context_logger.log_operation_end("execute_enhanced", success=False,
                                                 details=f"Invalid command: {error_msg}")

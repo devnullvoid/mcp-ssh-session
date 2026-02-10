@@ -73,6 +73,12 @@ class SSHSessionManager:
 
         # Terminal emulator support (enabled by default in v0.2.0+)
         self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "1") == "1"
+        self._pty_aware_validation = (
+            os.environ.get("MCP_SSH_PTY_AWARE_VALIDATION", "0") == "1"
+        )
+        self._mikrotik_auto_without_paging = (
+            os.environ.get("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1") == "1"
+        )
         self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
         self._session_modes: Dict[str, str] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
 
@@ -88,6 +94,14 @@ class SSHSessionManager:
 
         if self._interactive_mode:
             self.logger.info("Interactive PTY mode enabled")
+        if self._pty_aware_validation:
+            self.logger.info(
+                "PTY-aware command validation enabled (MCP_SSH_PTY_AWARE_VALIDATION=1)"
+            )
+        if self._mikrotik_auto_without_paging:
+            self.logger.info(
+                "MikroTik auto without-paging enabled (MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING=1)"
+            )
         self.logger.info("SSHSessionManager initialized")
 
         self.command_executor = CommandExecutor(self)
@@ -1203,6 +1217,42 @@ class SSHSessionManager:
             f'printf \'\\n{marker}%d\\n\' "$__mcp_status" 2>/dev/null || echo "{marker}$__mcp_status"\n'
         )
 
+    def _build_command_with_sentinel(self, command: str, marker: str, shell_path: str = "") -> str:
+        """Build command text with trailing sentinel in a heredoc-safe form."""
+        sentinel_command = self._build_sentinel_command(marker, shell_path)
+        return f"{command}\n{sentinel_command}"
+
+    def _maybe_rewrite_mikrotik_command(self, session_key: str, command: str) -> str:
+        """Append MikroTik 'without-paging' for print commands when safe."""
+        if not self._mikrotik_auto_without_paging:
+            return command
+
+        if self._session_shell_types.get(session_key) != "mikrotik":
+            return command
+
+        # Avoid rewriting multiline/script commands.
+        if "\n" in command:
+            return command
+
+        if re.search(r"(^|\s)without-paging(\s|$)", command, re.IGNORECASE):
+            return command
+
+        if not re.search(r"(^|\s)print(\s|$)", command, re.IGNORECASE):
+            return command
+
+        command_starts_with_slash = command.lstrip().startswith("/")
+        prompt = self._session_prompts.get(session_key, "")
+        menu_context = bool(re.search(r"\]\s+/[^>\s]*>\s*$", prompt))
+
+        if not (command_starts_with_slash or menu_context):
+            return command
+
+        rewritten = f"{command.rstrip()} without-paging"
+        self.logger.debug(
+            f"Rewrote MikroTik print command to include without-paging: {rewritten}"
+        )
+        return rewritten
+
     def _execute_with_thread_timeout(
         self, func, timeout: int, *args, **kwargs
     ) -> Tuple[str, str, int]:
@@ -1590,6 +1640,7 @@ class SSHSessionManager:
         - awaiting_input_reason is None if complete, or a string describing what input is needed
         """
         logger = self.logger.getChild("standard_command")
+        command = self._maybe_rewrite_mikrotik_command(session_key, command)
 
         # Check if this command will change the shell context
         context_changing = self._is_context_changing_command(command)
@@ -1621,12 +1672,7 @@ class SSHSessionManager:
             command_to_send = command
             if is_unix:
                 marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
-                command_to_send = self._build_sentinel_command(marker, "")
-                # Inject user command before sentinel
-                # The _build_sentinel_command creates:
-                # __mcp_status=$?; printf '\n{marker}%d\n' "$__mcp_status" ...
-                # We need to prepend the actual command
-                command_to_send = f"{command}; {command_to_send}"
+                command_to_send = self._build_command_with_sentinel(command, marker, "")
                 sentinel = marker
                 logger.debug(f"Using sentinel marker: {sentinel}")
 

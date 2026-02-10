@@ -83,9 +83,15 @@ def execute_command(
     # Check if command transitioned to async mode
     if exit_status == 124:
         if stderr.startswith("ASYNC:"):
-            command_id = stderr.split(":", 1)[1]
+            parts = stderr.split(":", 2)
+            command_id = parts[1]
+            reason = parts[2] if len(parts) > 2 else ""
+            if reason == "long_running":
+                headline = "Command started in background because it is likely long-running."
+            else:
+                headline = f"Command exceeded timeout of {timeout}s and is now running in background."
             response = (
-                f"Command exceeded timeout of {timeout}s and is now running in background.\n\n"
+                f"{headline}\n\n"
                 f"Command ID: {command_id}\n\n"
                 f"Use get_command_status('{command_id}') to check progress.\n"
                 f"Use interrupt_command_by_id('{command_id}') to stop it."

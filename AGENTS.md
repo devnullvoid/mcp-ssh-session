@@ -249,6 +249,31 @@ The session manager includes automatic recovery mechanisms:
 
 The project uses Python 3.10+ and is structured as a standard Python package.
 
+### Testing Workflow (Recommended)
+
+Use `uv run` for all local commands so tests work even when the virtualenv is not manually activated.
+
+```bash
+uv run pytest -q
+uv run pytest -q tests/test_bug_regressions.py
+```
+
+For integration tests:
+
+```bash
+SSH_TEST_HOST=host SSH_TEST_USER=user uv run pytest -q tests/test_integration.py
+```
+
+This repo includes `.envrc` for `direnv` users. Run `direnv allow` once.
+
+For command validation behavior in PTY mode:
+- `MCP_SSH_PTY_AWARE_VALIDATION=1` relaxes validation for read-only multiplexer inspection commands.
+- Default is strict validation (`0`).
+
+For MikroTik command behavior:
+- `MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING=1` auto-appends `without-paging` to MikroTik `print` commands.
+- Default is enabled (`1`).
+
 ### Key Components
 
 - **[server.py](mcp_ssh_session/server.py)**: MCP tool definitions and request handling

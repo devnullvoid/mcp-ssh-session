@@ -27,7 +27,10 @@ class MockShell:
             print("[MOCK SHELL] Sending 'q' to quit pager")
             self.output_queue.append("\r\n[jon@MikroTik] > ")
             self._recv_ready = True
-        elif data.strip() == "/interface bridge port print":
+        elif data.strip() in (
+            "/interface bridge port print",
+            "/interface bridge port print without-paging",
+        ):
             print("[MOCK SHELL] Executing Mikrotik command that triggers pager")
             response = (
                 "Flags: I - INACTIVE\r\n"

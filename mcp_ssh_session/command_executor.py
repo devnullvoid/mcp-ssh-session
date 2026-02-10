@@ -44,7 +44,13 @@ class CommandExecutor:
         logger.info(f"[EXEC_REQ] host={host}, cmd={command[:100]}..., timeout={timeout}")
 
         # Validate command
-        is_valid, error_msg = self._session_manager._command_validator.validate_command(command)
+        is_valid, error_msg = self._session_manager._command_validator.validate_command(
+            command,
+            pty_aware=(
+                self._session_manager._interactive_mode
+                and self._session_manager._pty_aware_validation
+            ),
+        )
         if not is_valid:
             logger.warning(f"[EXEC_INVALID] {error_msg}")
             return "", error_msg, 1
@@ -58,6 +64,12 @@ class CommandExecutor:
             )
         except Exception as e:
             return "", str(e), 1
+
+        # Package manager installs/upgrades commonly exceed MCP client-side call timeouts.
+        # Start these in async mode immediately and let callers poll for completion.
+        if self._should_start_async_immediately(command):
+            logger.info(f"[EXEC_ASYNC_IMMEDIATE] command_id={command_id}")
+            return "", f"ASYNC:{command_id}:long_running", 124
             
         logger.debug(f"[EXEC_ASYNC_ID] command_id={command_id}")
 
@@ -99,6 +111,21 @@ class CommandExecutor:
         logger.warning(f"[EXEC_TIMEOUT] Command {command_id} timed out after {timeout}s")
         status_on_timeout = self.get_command_status(command_id)
         return status_on_timeout.get('stdout', ''), f"ASYNC:{command_id}", 124
+
+    @staticmethod
+    def _should_start_async_immediately(command: str) -> bool:
+        command_lower = command.lower().strip()
+        long_running_patterns = [
+            r"\bpkg\s+(install|upgrade|update)\b",
+            r"\bapt(?:-get)?\s+(install|upgrade|update|dist-upgrade|full-upgrade)\b",
+            r"\b(?:dnf|yum|zypper|pacman|apk)\s+(install|upgrade|update)\b",
+            r"\bbrew\s+(install|upgrade|update)\b",
+            r"\b(?:pip|pip3)\s+install\b",
+            r"\bnpm\s+install\b",
+            r"\bpnpm\s+install\b",
+            r"\byarn\s+add\b",
+        ]
+        return any(re.search(pattern, command_lower) for pattern in long_running_patterns)
 
     def execute_command_async(self, host: str, username: Optional[str] = None,
                              command: str = "", password: Optional[str] = None,
@@ -160,11 +187,7 @@ class CommandExecutor:
                             logger.error(f"Failed to auto-interrupt stuck command: {e}")
                         # Continue to allow the new command
                     else:
-                        error_msg = (
-                            f"A command is already running or awaiting input in this session ({session_key}).\n"
-                            f"Running Command ID: {cmd.command_id}\n"
-                            f"Running Command Status: {cmd.status.value}"
-                        )
+                        error_msg = self._build_running_command_error(session_key, cmd)
                         logger.error(error_msg)
                         raise Exception(error_msg)
 
@@ -181,6 +204,19 @@ class CommandExecutor:
         logger.info(f"[ASYNC_SUBMITTED] command_id={command_id}")
 
         return command_id
+
+    @staticmethod
+    def _build_running_command_error(session_key: str, cmd: RunningCommand) -> str:
+        return (
+            f"A command is already running or awaiting input in this session ({session_key}).\n"
+            f"Active Command ID: {cmd.command_id}\n"
+            f"Active Command Status: {cmd.status.value}\n"
+            "This usually means a previous command timed out and continues in background monitoring.\n"
+            "Next steps:\n"
+            f"- Check progress: get_command_status('{cmd.command_id}')\n"
+            f"- Interrupt it: interrupt_command_by_id('{cmd.command_id}')\n"
+            "- Or wait until it completes before running another command."
+        )
 
     def _execute_command_async_worker(self, command_id: str, client: paramiko.SSHClient,
                                        command: str, timeout: int, session_key: str,
