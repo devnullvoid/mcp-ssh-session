@@ -18,6 +18,12 @@ except AttributeError:  # Paramiko 4.x moved it
 
 import pyte
 
+try:
+    from paramiko import NoValidConnectionsError
+except ImportError:
+    # paramiko 4.0.0+ moved NoValidConnectionsError to ssh_exception
+    from paramiko.ssh_exception import NoValidConnectionsError
+
 from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
 from .file_manager import FileManager
