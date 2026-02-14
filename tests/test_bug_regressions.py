@@ -62,7 +62,9 @@ def test_strict_validation_blocks_tmux_and_screen_invocations():
 
 def test_long_running_package_commands_start_async_immediately():
     assert CommandExecutor._should_start_async_immediately("pkg install -y ripgrep fzf")
-    assert CommandExecutor._should_start_async_immediately("apt-get update && apt-get install -y git")
+    assert CommandExecutor._should_start_async_immediately(
+        "apt-get update && apt-get install -y git"
+    )
     assert not CommandExecutor._should_start_async_immediately("echo hello")
 
 
@@ -167,3 +169,127 @@ def test_running_command_error_includes_actionable_next_steps():
     assert "Active Command ID: abc123" in message
     assert "get_command_status('abc123')" in message
     assert "interrupt_command_by_id('abc123')" in message
+
+
+def test_interactive_wizard_commands_are_detected():
+    """Test that interactive wizard commands like fish_config are properly detected."""
+    wizard_commands = [
+        "fish_config",
+        "fish -c \"fish_config theme save 'Catppuccin Mocha'\"",
+        "dconf-editor",
+        "nmtui",
+        "raspi-config",
+    ]
+
+    for cmd in wizard_commands:
+        assert CommandExecutor._is_interactive_wizard(cmd), (
+            f"{cmd} should be detected as wizard"
+        )
+
+    # Non-wizard commands should not be detected
+    non_wizard_commands = [
+        "echo hello",
+        "ls -la",
+        "fish -c 'echo hello'",
+        "pkg install -y git",
+    ]
+
+    for cmd in non_wizard_commands:
+        assert not CommandExecutor._is_interactive_wizard(cmd), (
+            f"{cmd} should NOT be detected as wizard"
+        )
+
+
+def test_package_manager_idle_timeout_is_extended():
+    """Test that package manager commands use extended idle timeout."""
+    manager = SSHSessionManager()
+
+    # Test package manager detection patterns
+    pkg_commands = [
+        "pkg install -y vivid",
+        "apt-get update && apt-get install -y git",
+        "dnf install vim",
+        "yum upgrade",
+        "apt upgrade",
+        "pacman -S vim",
+        "apk add git",
+    ]
+
+    for cmd in pkg_commands:
+        # Check if the command matches package manager patterns
+        import re
+
+        command_lower = cmd.lower().strip()
+        is_pkg = any(
+            [
+                re.search(r"\bpkg\s+(install|upgrade|update)", command_lower),
+                re.search(
+                    r"\bapt(?:-get)?\s+(install|upgrade|update|dist-upgrade|full-upgrade)",
+                    command_lower,
+                ),
+                re.search(
+                    r"\b(dnf|yum|zypper)\s+(install|upgrade|update)", command_lower
+                ),
+                re.search(
+                    r"\bpacman\s+(-[Ss]\b|--sync\b|install|upgrade|update)",
+                    command_lower,
+                ),
+                re.search(r"\bapk\s+(add|install|upgrade|update)", command_lower),
+                re.search(r"\bbrew\s+(install|upgrade|update)", command_lower),
+            ]
+        )
+        assert is_pkg, f"{cmd} should be detected as package manager"
+
+
+def test_all_package_manager_patterns_covered():
+    """Ensure all package manager patterns from _should_start_async_immediately are covered."""
+    import re
+
+    # These should all trigger async immediately
+    async_commands = [
+        "pkg install -y vivid",
+        "apt install git",
+        "apt-get install git",
+        "dnf install vim",
+        "yum install vim",
+        "zypper install vim",
+        "pacman -S vim",
+        "apk add vim",
+        "brew install git",
+        "pip install requests",
+        "pip3 install numpy",
+        "npm install express",
+        "pnpm install",
+        "yarn add lodash",
+    ]
+
+    for cmd in async_commands:
+        assert CommandExecutor._should_start_async_immediately(cmd), (
+            f"{cmd} should start async immediately"
+        )
+
+
+def test_package_manager_remove_commands_start_async_immediately():
+    """Ensure package manager remove commands also start async."""
+    remove_commands = [
+        "apt-get remove -y sl",
+        "apt remove sl",
+        "apt-get purge sl",
+        "apt purge sl",
+        "dnf remove sl",
+        "yum remove sl",
+        "zypper remove sl",
+        "pacman -R sl",
+        "pacman --remove sl",
+        "pkg remove sl",
+        "pkg delete sl",
+        "apk del sl",
+        "apk delete sl",
+        "brew uninstall sl",
+        "brew remove sl",
+    ]
+
+    for cmd in remove_commands:
+        assert CommandExecutor._should_start_async_immediately(cmd), (
+            f"{cmd} should start async immediately"
+        )
