@@ -105,7 +105,7 @@ def streaming_manager(mock_ssh_client):
     shell = mock_ssh_client.invoke_shell.return_value
 
     def fake_streaming_execute(client, command, timeout, skey):
-        return f"[streaming start] {command}\n", "", 124, None
+        return f"[streaming start] {command}\n", "", 124, None, None
 
     with patch.object(
         manager, "_resolve_connection", return_value=({}, host, user, port, session_key)

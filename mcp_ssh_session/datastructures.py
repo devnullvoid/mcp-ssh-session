@@ -66,6 +66,7 @@ class RunningCommand:
     end_time: Optional[datetime]
     awaiting_input_reason: Optional[str] = None  # What is the command waiting for? (e.g., "password", "user_input")
     monitoring_cancelled: threading.Event = field(default_factory=threading.Event)
+    sentinel: Optional[str] = None  # Sentinel marker used for Unix command completion
     
     # New fields for enhanced UX
     auto_extend_timeout: bool = False

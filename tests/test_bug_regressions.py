@@ -89,7 +89,7 @@ def test_sentinel_wrapping_preserves_heredoc_delimiter_line():
     rendered = manager._build_command_with_sentinel(command, "__MCP_CMD_TEST__")
 
     assert "EOF; __mcp_status=$?" not in rendered
-    assert re.search(r"EOF\n__mcp_status=\$\?", rendered)
+    assert re.search(r"EOF\n __mcp_status=\$\?", rendered)
 
 
 def test_manager_reads_pty_aware_validation_flag(monkeypatch):
