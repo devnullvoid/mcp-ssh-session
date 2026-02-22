@@ -1,5 +1,10 @@
 # MCP SSH Session
 
+> [!IMPORTANT]
+> **This project has pivoted to [mcp-ssh-tmux](https://github.com/devnullvoid/mcp-ssh-tmux)**. 
+> The new version uses `tmux` for improved persistence, observability, and a superior "LLM-as-Observer" approach. This repository is now in maintenance mode.
+
+
 An MCP (Model Context Protocol) server that enables AI agents to establish and manage persistent SSH sessions.
 
 <a href="https://glama.ai/mcp/servers/@devnullvoid/mcp-ssh-session">
