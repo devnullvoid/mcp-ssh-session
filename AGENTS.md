@@ -240,6 +240,57 @@ The session manager includes automatic recovery mechanisms:
 - Output limited to 10MB per command to prevent memory exhaustion
 - File operations capped at 2MB for safety
 
+### Environment Variable Override System
+
+For production environments where AI agents should not have access to real credentials, you can use the environment variable override system. This allows you to:
+
+1. Use fake/alias hostnames in agent conversations (e.g., "prod-db")
+2. Store real credentials in environment variables
+3. Keep sensitive credentials out of the AI context
+
+**Environment Variable Format:**
+```
+OVRD_{alias}_{PARAM}
+```
+
+**Supported Parameters:**
+
+| Variable | Description |
+|----------|-------------|
+| `OVRD_{alias}_HOST` | Real hostname/IP address |
+| `OVRD_{alias}_PORT` | SSH port (default: 22) |
+| `OVRD_{alias}_USER` | SSH username |
+| `OVRD_{alias}_PASS` | SSH password |
+| `OVRD_{alias}_KEY` | Path to SSH private key |
+| `OVRD_{alias}_SUDO_PASS` | Sudo password |
+| `OVRD_{alias}_ENABLE_PASS` | Enable password for network devices |
+
+**Example Configuration:**
+```json
+{
+  "mcpServers": {
+    "ssh-session": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-ssh-session"],
+      "env": {
+        "OVRD_prod_db_HOST": "192.168.1.100",
+        "OVRD_prod_db_USER": "admin",
+        "OVRD_prod_db_PASS": "secret123",
+        "OVRD_prod_db_SUDO_PASS": "sudopass"
+      }
+    }
+  }
+}
+```
+
+The agent then uses the alias `prod_db` without knowing the real credentials:
+```python
+execute_command(host="prod_db", command="systemctl status postgresql")
+```
+
+This feature is fully backward compatible - if environment variables are not set, the system works normally with provided parameters.
+
 ## Dependencies
 
 - `fastmcp`: MCP server framework

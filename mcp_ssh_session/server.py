@@ -1,5 +1,6 @@
 """MCP server for SSH session management."""
 import json
+import os
 from typing import Optional
 from fastmcp import FastMCP
 from .session_manager import SSHSessionManager
@@ -59,6 +60,12 @@ def execute_command(
     """
     logger = session_manager.logger.getChild('tool_execute_command')
     logger.info(f"Executing command on {host}: {command[:100]}...")
+    
+    # Apply environment variable overrides for credentials
+    if not sudo_password and command.strip().startswith("sudo"):
+        sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
+    if not enable_password:
+        enable_password = os.getenv(f"OVRD_{host}_ENABLE_PASS")
     
     try:
         stdout, stderr, exit_status = session_manager.execute_command(

@@ -312,6 +312,65 @@ Then simply use:
 }
 ```
 
+## Environment Variable Override System (Credential Hiding)
+
+For production environments where AI agents should not have access to real credentials, you can use environment variables to override connection parameters. This allows agents to use simple aliases while real credentials are stored securely in the MCP server configuration.
+
+**Use case:** Hide real hostnames, IPs, usernames, and passwords from AI agents while still allowing them to manage production servers.
+
+### Supported Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `OVRD_{alias}_HOST` | Real hostname or IP address |
+| `OVRD_{alias}_PORT` | SSH port (default: 22) |
+| `OVRD_{alias}_USER` | SSH username |
+| `OVRD_{alias}_PASS` | SSH password |
+| `OVRD_{alias}_KEY` | Path to SSH private key file |
+| `OVRD_{alias}_SUDO_PASS` | Sudo password |
+| `OVRD_{alias}_ENABLE_PASS` | Enable password for network devices (routers/switches) |
+
+### Example Configuration
+
+**Claude Desktop config (`~/.claude.json`):**
+```json
+{
+  "mcpServers": {
+    "ssh-session": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-ssh-session"],
+      "env": {
+        "OVRD_prod_db_HOST": "192.168.1.100",
+        "OVRD_prod_db_USER": "admin",
+        "OVRD_prod_db_PASS": "secret_password",
+        "OVRD_prod_db_SUDO_PASS": "sudo_password"
+      }
+    }
+  }
+}
+```
+
+**Agent uses the alias (knows nothing about real credentials):**
+```json
+{
+  "host": "prod_db",
+  "command": "systemctl status postgresql"
+}
+```
+
+**System resolves to real credentials:**
+- Host: `prod_db` → `192.168.1.100`
+- User: (from env) → `admin`
+- Password: (from env) → `secret_password`
+
+### Notes
+
+- Fully backward compatible - works without environment variables
+- The agent sees only the alias (`prod_db`), not the real IP
+- Credentials never appear in the AI context
+- Works with all tools: `execute_command`, `read_file`, `write_file`, etc.
+
 ## How It Works
 
 ### Persistent Shell Sessions

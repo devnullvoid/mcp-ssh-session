@@ -236,15 +236,53 @@ class SSHSessionManager:
     def _resolve_connection(
         self, host: str, username: Optional[str], port: Optional[int]
     ) -> tuple[Dict[str, Any], str, str, int, str]:
-        """Resolve SSH connection parameters using config precedence."""
+        """Resolve SSH connection parameters using config precedence.
+        
+        Environment variable overrides (prefix with OVRD_{host}_):
+        - HOST: Override hostname
+        - USER: Override username  
+        - PORT: Override port
+        - KEY: Override key file path
+        - PASS: Override password
+        - SUDO_PASS: Override sudo password
+        - ENABLE_PASS: Override enable password (for network devices)
+        """
         host_config = self._ssh_config.lookup(host)
         resolved_host = host_config.get("hostname", host)
         resolved_username = username or host_config.get(
             "user", os.getenv("USER", "root")
         )
         resolved_port = port or int(host_config.get("port", 22))
+        
+        # Apply environment variable overrides
+        env_prefix = f"OVRD_{host}_"
+        if override_host := os.getenv(f"{env_prefix}HOST"):
+            resolved_host = override_host
+        if override_user := os.getenv(f"{env_prefix}USER"):
+            resolved_username = override_user
+        if port_str := os.getenv(f"{env_prefix}PORT"):
+            try:
+                resolved_port = int(port_str)
+            except ValueError:
+                self.logger.warning(f"Invalid port in {env_prefix}PORT: {port_str}")
+        
         session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
         return host_config, resolved_host, resolved_username, resolved_port, session_key
+    
+    def _get_env_override(
+        self, host: str, param: str, default: Optional[str] = None
+    ) -> Optional[str]:
+        """Get environment variable override for a host parameter.
+        
+        Args:
+            host: The host alias/name used in the tool call
+            param: The parameter name (e.g., 'PASS', 'KEY', 'SUDO_PASS')
+            default: Default value if env var is not set
+            
+        Returns:
+            The override value from environment variable or default
+        """
+        return os.getenv(f"OVRD_{host}_{param}", default)
 
     def _load_ssh_config(self) -> paramiko.SSHConfig:
         """Load SSH config from default locations."""
@@ -281,6 +319,12 @@ class SSHSessionManager:
             self._resolve_connection(host, username, port)
         )
         resolved_key = key_filename or host_config.get("identityfile", [None])[0]
+        
+        # Apply environment variable overrides for credentials
+        if env_key := self._get_env_override(host, "KEY"):
+            resolved_key = env_key
+        if env_pass := self._get_env_override(host, "PASS"):
+            password = env_pass
 
         with self._lock:
             if session_key in self._sessions:

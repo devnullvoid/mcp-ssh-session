@@ -1,6 +1,7 @@
 """File management for SSH sessions."""
 import base64
 import logging
+import os
 import posixpath
 import shlex
 import stat
@@ -28,6 +29,10 @@ class FileManager:
         if not remote_path:
             logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
+
+        # Apply environment variable override for sudo password
+        if not sudo_password and use_sudo:
+            sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
 
         _, _, _, _, session_key = self._session_manager._resolve_connection(host, username, port)
         client = self._session_manager.get_or_create_session(host, username, password, key_filename, port)
@@ -151,6 +156,10 @@ class FileManager:
         if not remote_path:
             logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
+
+        # Apply environment variable override for sudo password
+        if not sudo_password and use_sudo:
+            sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
 
         used_encoding = encoding or "utf-8"
         used_errors = errors or "strict"
