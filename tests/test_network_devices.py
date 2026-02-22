@@ -228,10 +228,12 @@ class TestMikrotikPaloAltoDevices:
         # Palo Alto shows: (END) or -- More --
 
         # Try a command likely to trigger paging
+        # Using lighter commands that produce manageable output
         commands_to_try = [
-            "/export",  # MikroTik: export full config
-            "show config running",  # Palo Alto: show running config
-            "/system resource print detail",  # MikroTik: detailed system info
+            "/interface print detail",  # MikroTik: interface details (moderate output)
+            "/ip address print detail",  # MikroTik: IP address details
+            "/system resource print",  # MikroTik: system info
+            "show system info",  # Palo Alto: system info
         ]
 
         # Try each command until one succeeds (depends on device type)
