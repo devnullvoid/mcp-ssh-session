@@ -1,9 +1,8 @@
 # MCP SSH Session
 
 > [!IMPORTANT]
-> **This project has pivoted to [mcp-ssh-tmux](https://github.com/devnullvoid/mcp-ssh-tmux)**. 
-> The new version uses `tmux` for improved persistence, observability, and a superior "LLM-as-Observer" approach. This repository is now in maintenance mode.
-
+> **Alternative version: [mcp-ssh-tmux](https://github.com/devnullvoid/mcp-ssh-tmux)**.
+> Uses `tmux` for improved persistence, observability, and a superior "LLM-as-Observer" approach.
 
 An MCP (Model Context Protocol) server that enables AI agents to establish and manage persistent SSH sessions.
 
@@ -69,17 +68,20 @@ uv pip install -e .
 ### Available Tools
 
 #### `execute_command`
+
 Execute a command on an SSH host using a persistent session.
 
 **Smart Execution**: Starts synchronously and waits for completion. If timeout is reached, automatically transitions to async mode and returns a command ID. Server never hangs!
 
 **Advanced Features**:
+
 - Automatic timeout handling with async transition
 - Interactive command support (use `send_input` for prompts)
 - Command interruption capability (`interrupt_command_by_id`)
 - Session persistence across multiple commands
 
 **Using SSH config alias:**
+
 ```json
 {
   "host": "myserver",
@@ -88,6 +90,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Using explicit parameters:**
+
 ```json
 {
   "host": "example.com",
@@ -99,6 +102,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Network device with enable mode:**
+
 ```json
 {
   "host": "router.example.com",
@@ -110,6 +114,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Unix/Linux with sudo:**
+
 ```json
 {
   "host": "server.example.com",
@@ -120,9 +125,11 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 #### `list_sessions`
+
 List all active SSH sessions.
 
 #### `close_session`
+
 Close a specific SSH session.
 
 ```json
@@ -132,12 +139,15 @@ Close a specific SSH session.
 ```
 
 #### `close_all_sessions`
+
 Close all active SSH sessions.
 
 #### `execute_command_async`
+
 Execute a command asynchronously without blocking the server. Returns a command ID for tracking.
 
 **Use with companion tools**:
+
 - `get_command_status(command_id)` - Check progress and retrieve output
 - `interrupt_command_by_id(command_id)` - Send Ctrl+C to stop execution  
 - `send_input(command_id, text)` - Provide input to interactive commands
@@ -151,6 +161,7 @@ Execute a command asynchronously without blocking the server. Returns a command 
 ```
 
 #### `get_command_status`
+
 Get the status and output of an async command.
 
 ```json
@@ -160,6 +171,7 @@ Get the status and output of an async command.
 ```
 
 #### `interrupt_command_by_id`
+
 Interrupt a running async command by sending Ctrl+C.
 
 ```json
@@ -169,9 +181,11 @@ Interrupt a running async command by sending Ctrl+C.
 ```
 
 #### `list_running_commands`
+
 List all currently running async commands.
 
 #### `list_command_history`
+
 List recent command history (completed, failed, interrupted commands).
 
 ```json
@@ -181,9 +195,11 @@ List recent command history (completed, failed, interrupted commands).
 ```
 
 #### `read_file`
+
 Read the contents of a remote file via SFTP, with optional sudo support.
 
 **Basic usage:**
+
 ```json
 {
   "host": "myserver",
@@ -193,6 +209,7 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 ```
 
 **With passwordless sudo (NOPASSWD in sudoers):**
+
 ```json
 {
   "host": "myserver",
@@ -202,6 +219,7 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 ```
 
 **With sudo password:**
+
 ```json
 {
   "host": "myserver",
@@ -217,9 +235,11 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 - Returns truncated notice when the content size exceeds the requested limit
 
 #### `write_file`
+
 Write text content to a remote file via SFTP, with optional sudo support.
 
 **Basic usage:**
+
 ```json
 {
   "host": "myserver",
@@ -231,6 +251,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ```
 
 **With passwordless sudo (NOPASSWD in sudoers):**
+
 ```json
 {
   "host": "myserver",
@@ -242,6 +263,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ```
 
 **With sudo password:**
+
 ```json
 {
   "host": "myserver",
@@ -264,6 +286,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ## SSH Config Support
 
 The server automatically reads `~/.ssh/config` and supports:
+
 - Host aliases
 - Hostname mappings
 - Port configurations
@@ -271,6 +294,7 @@ The server automatically reads `~/.ssh/config` and supports:
 - IdentityFile settings
 
 Example `~/.ssh/config`:
+
 ```
 Host myserver
     HostName example.com
@@ -280,6 +304,7 @@ Host myserver
 ```
 
 Then simply use:
+
 ```json
 {
   "host": "myserver",
@@ -290,13 +315,17 @@ Then simply use:
 ## How It Works
 
 ### Persistent Shell Sessions
+
 Commands execute in persistent interactive shells that maintain state:
+
 - Current directory persists across commands (`cd /tmp` stays in `/tmp`)
 - Environment variables remain set
 - Shell history is maintained
 
 ### Smart Command Completion Detection
+
 Commands complete when either:
+
 1. **Prompt detected**: Standard shell prompts (`$`, `#`, `>`, `%`) at end of output
 2. **Idle timeout**: No output for 2 seconds after receiving data
 
@@ -312,3 +341,4 @@ Commands complete when either:
 ## License
 
 Distributed under the MIT License. See `LICENSE` for details.
+
